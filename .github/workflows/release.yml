@@ -1,11 +1,11 @@
 name: Release
 
 # Push a version tag (e.g. v2.2.0) to build the addon zip, publish a GitHub
-# release and upload it to CurseForge.
+# release and upload it to CurseForge (same setup as axlroden/SpellReplay).
 #
-# One-time setup (repository settings > Secrets and variables > Actions):
-#   secret   CF_API_KEY     - CurseForge API token
-#   variable CF_PROJECT_ID  - the CurseForge project ID
+# One-time setup:
+#   - "## X-Curse-Project-ID: <id>" in RollCasino.toc
+#   - repository secret CF_API_KEY = CurseForge API token
 # Without them the CurseForge upload is skipped; the GitHub release still runs.
 
 on:
@@ -13,22 +13,18 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write
-
 jobs:
   release:
     runs-on: ubuntu-latest
-    env:
-      CF_API_KEY: ${{ secrets.CF_API_KEY }}
-      GITHUB_OAUTH: ${{ secrets.GITHUB_TOKEN }}
+    permissions:
+      contents: write
     steps:
-      - name: Check out
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0   # full history for the packager
 
-      - name: Package and release
+      - name: Package and upload
         uses: BigWigsMods/packager@v2
-        with:
-          args: ${{ vars.CF_PROJECT_ID && format('-p {0}', vars.CF_PROJECT_ID) || '' }}
+        env:
+          CF_API_KEY: ${{ secrets.CF_API_KEY }}
+          GITHUB_OAUTH: ${{ secrets.GITHUB_TOKEN }}

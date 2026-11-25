@@ -5,6 +5,8 @@ manual-changelog:
   markup-type: markdown
 
 ignore:
+  - .github
+  - .pkgmeta
   - README.md
   - CHANGELOG.md
   - media/logo.png
