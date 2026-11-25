@@ -1,10 +1,10 @@
 name: Release
 
 # Push a version tag (e.g. v2.2.0) to build the addon zip, publish a GitHub
-# release and upload it to CurseForge (same setup as axlroden/SpellReplay).
+# release and upload it to CurseForge (same setup as axlroden/SpellReplay; CurseForge project 1831355).
 #
 # One-time setup:
-#   - "## X-Curse-Project-ID: <id>" in RollCasino.toc
+#   - "## X-Curse-Project-ID: <id>" in HiLoCasino.toc
 #   - repository secret CF_API_KEY = CurseForge API token
 # Without them the CurseForge upload is skipped; the GitHub release still runs.
 

@@ -1,4 +1,4 @@
---[[ Roll Casino
+--[[ Hi-Lo Casino  (named Roll Casino before 2.2.0)
      Original author: Pytte
      2.0 rewrite: Ace3 (AceAddon / AceDB / LibDBIcon)
      2.1: hand-built window in the NaowhForever house look (follows its
@@ -8,7 +8,7 @@
 
 local ADDON = ...
 
-local RC      = LibStub("AceAddon-3.0"):NewAddon("RollCasino", "AceConsole-3.0", "AceEvent-3.0")
+local RC      = LibStub("AceAddon-3.0"):NewAddon("HiLoCasino", "AceConsole-3.0", "AceEvent-3.0")
 local LDB     = LibStub("LibDataBroker-1.1", true)
 local LDBIcon = LibStub("LibDBIcon-1.0", true)
 
@@ -50,7 +50,7 @@ local defaults = {
 		enterMsg      = "1",
 		withdrawMsg   = "-1",
 		chatMethod    = "RAID",
-		customChannel = "rollcasino",
+		customChannel = "hilocasino",
 		stakesGold    = 20,        -- gold the host wants to gamble for
 		ratio         = 100,       -- roll cap = stakesGold * ratio
 		rulesName     = "Hi/Lo",
@@ -438,7 +438,7 @@ function RC:PostLeaderboard(which, n, period)
 		self:Print("No rounds recorded for " .. self:PeriodName(period) .. ".")
 		return
 	end
-	self:ChatMsg(format(".:RC %s %d - %s:.", which == "bottom" and "Bottom" or "Top", #list, self:PeriodName(period)))
+	self:ChatMsg(format(".:HiLo %s %d - %s:.", which == "bottom" and "Bottom" or "Top", #list, self:PeriodName(period)))
 	for i, p in ipairs(list) do
 		local detail
 		if p.rounds == 0 then
@@ -463,16 +463,16 @@ function RC:PostSummary(period)
 		self:Print("No rounds recorded for " .. self:PeriodName(period) .. ".")
 		return
 	end
-	self:ChatMsg(format(".:RC Stats - %s:. %d %s (%d %s), %s changed hands",
+	self:ChatMsg(format(".:HiLo Stats - %s:. %d %s (%d %s), %s changed hands",
 		self:PeriodName(period), totals.rounds, Plural(totals.rounds, "round", "rounds"),
 		totals.ties, Plural(totals.ties, "tie", "ties"), Gold(totals.moved)))
 	if totals.biggest then
-		self:ChatMsg(format(".:RC:. Biggest round: %s (%s)", RoundResult(totals.biggest),
+		self:ChatMsg(format(".:HiLo:. Biggest round: %s (%s)", RoundResult(totals.biggest),
 			date("%d %b %H:%M", totals.biggest.t)))
 	end
 	local top, bottom = order[1], order[#order]
 	if top and top.net > 0 then
-		self:ChatMsg(format(".:RC:. Luckiest: %s %s  -  Unluckiest: %s %s", top.name, Gold(top.net, true),
+		self:ChatMsg(format(".:HiLo:. Luckiest: %s %s  -  Unluckiest: %s %s", top.name, Gold(top.net, true),
 			bottom.name, Gold(bottom.net, true)))
 	end
 end
@@ -481,8 +481,8 @@ function RC:PostRound(rec)
 	if not rec or rec.legacy then return end
 	local rolls = {}
 	for _, pl in ipairs(rec.players or {}) do rolls[#rolls + 1] = pl.n .. " " .. pl.r end
-	self:ChatMsg(format(".:RC Round %s:. %s", date("%H:%M", rec.t), RoundResult(rec)))
-	if #rolls > 0 then self:ChatMsg(".:RC:. Rolls: " .. table.concat(rolls, ", ")) end
+	self:ChatMsg(format(".:HiLo Round %s:. %s", date("%H:%M", rec.t), RoundResult(rec)))
+	if #rolls > 0 then self:ChatMsg(".:HiLo:. Rolls: " .. table.concat(rolls, ", ")) end
 end
 
 function RC:DeleteRound(rec)
@@ -528,7 +528,7 @@ function RC:ResetSessionStats() self:NewSession() end
 --==========================================================================
 
 function RC:PrintRules()
-	self:ChatMsg(format(".:RC:. %s RULES:.", db.profile.rulesName))
+	self:ChatMsg(format(".:HiLo:. %s RULES:.", db.profile.rulesName))
 	self:ChatMsg(".:Players will /roll the STAKES:.")
 	self:ChatMsg(".:High roll wins. Low Roll loses. Loser pays out the roll difference:.")
 end
@@ -575,10 +575,10 @@ function RC:ReportResults()
 
 		local msg = format("%s owes %s < %s >", lowNames, highNames, ConvertRollToGold(goldOwed))
 		if splitCount > 1 then msg = msg .. " each." end
-		self:ChatMsg(format(".:RC Payouts:. %s", msg))
+		self:ChatMsg(format(".:HiLo Payouts:. %s", msg))
 	else
 		rec.tie = true
-		self:ChatMsg(".:RC:. TIE! No payouts on this roll!")
+		self:ChatMsg(".:HiLo:. TIE! No payouts on this roll!")
 	end
 
 	self:RecordRound(rec)
@@ -610,19 +610,19 @@ function RC:StartRound()
 	round.acceptEntries = true
 	round.acceptRolls   = false
 
-	self:ChatMsg(format(".:Roll Casino:. RULES: %s .:. STAKES << %s >>", db.profile.rulesName, ConvertRollToGold(round.stakes)))
-	self:ChatMsg(format(".:RC:. To enter: type %s", db.profile.enterMsg))
+	self:ChatMsg(format(".:Hi-Lo Casino:. RULES: %s .:. STAKES << %s >>", db.profile.rulesName, ConvertRollToGold(round.stakes)))
+	self:ChatMsg(format(".:HiLo:. To enter: type %s", db.profile.enterMsg))
 end
 
 function RC:AnnounceLastCall()
-	self:ChatMsg(format(".:RC:. Last Call to join! To withdraw, type %s", db.profile.withdrawMsg))
+	self:ChatMsg(format(".:HiLo:. Last Call to join! To withdraw, type %s", db.profile.withdrawMsg))
 end
 
 function RC:AnnounceRolling()
 	if round.entrantsCount > 1 then
 		round.acceptEntries = false
 		round.acceptRolls   = true
-		self:ChatMsg(format(".:RC - /roll %s NOW:.", round.stakes))
+		self:ChatMsg(format(".:HiLo - /roll %s NOW:.", round.stakes))
 	else
 		self:ChatMsg("Not enough Players!")
 	end
@@ -635,7 +635,7 @@ function RC:RoundWrapup()
 	deferChat = false
 	self:ResetRound()
 	if pendingMsgs then
-		self:Print("|cffffff00Round complete.|r Click |cff59f0dcAnnounce Results|r (or type /rc next) to post the payouts.")
+		self:Print("|cffffff00Round complete.|r Click |cff59f0dcAnnounce Results|r (or type /hilo next) to post the payouts.")
 	else
 		self:Print("|cffffff00Round complete and reset.|r")
 	end
@@ -717,7 +717,7 @@ local ROW_H = 22
 local DISABLED_ALPHA = 0.4
 local BACKDROP_ALPHA = 0.97
 local CARD_FILL, CARD_EDGE = 0.035, 0.7
-local ICON = "Interface\\AddOns\\RollCasino\\media\\icon"
+local ICON = "Interface\\AddOns\\HiLoCasino\\media\\icon"
 
 local function Naowh()
 	local N = _G.NaowhForever
@@ -1125,7 +1125,7 @@ function RC:BuildWindow()
 	local ui = { rows = {} }
 	self.ui = ui
 
-	local f = CreateFrame("Frame", "RollCasinoWindow", UIParent)
+	local f = CreateFrame("Frame", "HiLoCasinoWindow", UIParent)
 	f:Hide()
 	f:SetSize(WIN_W, WIN_H)
 	f:SetFrameStrata("HIGH")
@@ -1142,7 +1142,7 @@ function RC:BuildWindow()
 	else
 		f:SetPoint("CENTER")
 	end
-	tinsert(UISpecialFrames, "RollCasinoWindow")   -- Esc closes it
+	tinsert(UISpecialFrames, "HiLoCasinoWindow")   -- Esc closes it
 	ui.frame = f
 
 	-- Backdrop, outer border, header rule.
@@ -1171,7 +1171,7 @@ function RC:BuildWindow()
 	logo:SetTexture(ICON)
 	local title = Text(f, 20, "fg", true, "LEFT")
 	title:SetPoint("TOPLEFT", logo, "TOPRIGHT", 10, 1)
-	Paint(function(T) title:SetText("Roll " .. Hex(T.accent) .. "Casino|r") end)
+	Paint(function(T) title:SetText("Hi-Lo " .. Hex(T.accent) .. "Casino|r") end)
 	ui.subtitle = Text(f, 11, "muted", false, "LEFT")
 	ui.subtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -2)
 	local close = Button(f, "x", 24, 24, function() f:Hide() end)
@@ -1181,7 +1181,7 @@ function RC:BuildWindow()
 	local brand = Text(f, 10, "muted", false, "LEFT")
 	brand:SetPoint("BOTTOMLEFT", PAD + 2, 6)
 	local version = (C_AddOns and C_AddOns.GetAddOnMetadata or GetAddOnMetadata)(ADDON, "Version") or ""
-	Paint(function(T) brand:SetText(Hex(T.fg) .. "Roll|r " .. Hex(T.accent) .. "Casino|r  " .. version) end)
+	Paint(function(T) brand:SetText(Hex(T.fg) .. "Hi-Lo|r " .. Hex(T.accent) .. "Casino|r  " .. version) end)
 	ui.potNote = Text(f, 10, "muted", false, "RIGHT")
 	ui.potNote:SetPoint("BOTTOMRIGHT", -PAD - 2, 6)
 
@@ -1542,7 +1542,7 @@ function RC:BuildHistory()
 	local h = { lbRows = {}, logRows = {} }
 	self.hist = h
 
-	local f = CreateFrame("Frame", "RollCasinoHistory", UIParent)
+	local f = CreateFrame("Frame", "HiLoCasinoHistory", UIParent)
 	f:Hide()
 	f:SetSize(HIST_W, HIST_H)
 	f:SetFrameStrata("HIGH")
@@ -1565,7 +1565,7 @@ function RC:BuildHistory()
 	else
 		f:SetPoint("CENTER")
 	end
-	tinsert(UISpecialFrames, "RollCasinoHistory")
+	tinsert(UISpecialFrames, "HiLoCasinoHistory")
 	h.frame = f
 
 	local bg = f:CreateTexture(nil, "BACKGROUND", nil, -8)
@@ -1756,7 +1756,7 @@ function RC:SlashCmd(input)
 	elseif cmd == "minimap" then
 		db.profile.minimap.hide = not db.profile.minimap.hide
 		if LDBIcon then
-			if db.profile.minimap.hide then LDBIcon:Hide("RollCasino") else LDBIcon:Show("RollCasino") end
+			if db.profile.minimap.hide then LDBIcon:Hide("HiLoCasino") else LDBIcon:Show("HiLoCasino") end
 		end
 		self:Print("Minimap button "..(db.profile.minimap.hide and "hidden" or "shown")..".")
 	elseif cmd == "history" or cmd == "stats" then
@@ -1775,22 +1775,22 @@ function RC:SlashCmd(input)
 	elseif cmd == "newsession" then
 		self:NewSession()
 	elseif cmd == "version" then
-		self:Print("RollCasino v"..(C_AddOns and C_AddOns.GetAddOnMetadata(ADDON, "Version") or GetAddOnMetadata(ADDON, "Version") or "2.0.0"))
+		self:Print("Hi-Lo Casino v"..(C_AddOns and C_AddOns.GetAddOnMetadata(ADDON, "Version") or GetAddOnMetadata(ADDON, "Version") or "2.0.0"))
 	else
-		self:Print("|cffffff00Roll Casino commands:|r")
-		self:Print("/rc  - toggle the window")
-		self:Print("/rc next  - advance the round phase")
-		self:Print("/rc reset  - reset the current round")
-		self:Print("/rc gold <n>  - set stakes in gold")
-		self:Print("/rc ratio <n>  - set roll:gold ratio (e.g. 10 or 100)")
-		self:Print("/rc channel <name>  - set custom chat channel")
-		self:Print("/rc history  - leaderboard and round log")
-		self:Print("/rc top [n] [period]  - post the top n winners (period: session, today, week, month, all)")
-		self:Print("/rc bottom [n] [period]  - post the n biggest losers")
-		self:Print("/rc summary [period]  - post a summary of the period")
-		self:Print("/rc newsession  - start a new \"This session\"")
-		self:Print("/rc minimap  - toggle the minimap button")
-		self:Print("/rc version")
+		self:Print("|cffffff00Hi-Lo Casino commands:|r  (/rc works too)")
+		self:Print("/hilo  - toggle the window")
+		self:Print("/hilo next  - advance the round phase")
+		self:Print("/hilo reset  - reset the current round")
+		self:Print("/hilo gold <n>  - set stakes in gold")
+		self:Print("/hilo ratio <n>  - set roll:gold ratio (e.g. 10 or 100)")
+		self:Print("/hilo channel <name>  - set custom chat channel")
+		self:Print("/hilo history  - leaderboard and round log")
+		self:Print("/hilo top [n] [period]  - post the top n winners (period: session, today, week, month, all)")
+		self:Print("/hilo bottom [n] [period]  - post the n biggest losers")
+		self:Print("/hilo summary [period]  - post a summary of the period")
+		self:Print("/hilo newsession  - start a new \"This session\"")
+		self:Print("/hilo minimap  - toggle the minimap button")
+		self:Print("/hilo version")
 	end
 end
 
@@ -1799,22 +1799,12 @@ end
 --==========================================================================
 
 function RC:OnInitialize()
-	self.db = LibStub("AceDB-3.0"):New("RollCasinoDB", defaults, true)
+	self.db = LibStub("AceDB-3.0"):New("HiLoCasinoDB", defaults, true)
 	db = self.db
-
-	-- Migrate legacy 1.x SavedVariable (flat name -> total table)
-	if type(_G.RollCasino) == "table" then
-		for name, total in pairs(_G.RollCasino) do
-			if type(name) == "string" and type(total) == "number" then
-				db.global.allTime[name] = (db.global.allTime[name] or 0) + total
-			end
-		end
-		_G.RollCasino = nil
-	end
 
 	-- Old default channel -> new default
 	if db.profile.customChannel == "RollGamble" then
-		db.profile.customChannel = "rollcasino"
+		db.profile.customChannel = "hilocasino"
 	end
 
 	-- Migrate v2.0 roll-cap setting -> gold amount
@@ -1844,10 +1834,10 @@ function RC:OnInitialize()
 
 	-- Minimap launcher
 	if LDB and LDBIcon then
-		local obj = LDB:NewDataObject("RollCasino", {
+		local obj = LDB:NewDataObject("HiLoCasino", {
 			type = "launcher",
-			text = "Roll Casino",
-			icon = "Interface\\AddOns\\RollCasino\\media\\icon",
+			text = "Hi-Lo Casino",
+			icon = "Interface\\AddOns\\HiLoCasino\\media\\icon",
 			OnClick = function(_, button)
 				if button == "RightButton" then
 					RC:PostLeaderboard("top")
@@ -1858,17 +1848,18 @@ function RC:OnInitialize()
 				end
 			end,
 			OnTooltipShow = function(tt)
-				tt:AddLine("Roll Casino")
+				tt:AddLine("Hi-Lo Casino")
 				tt:AddLine("|cffffffffLeft-click:|r toggle window")
 				tt:AddLine("|cffffffffShift-click:|r history")
 				tt:AddLine(format("|cffffffffRight-click:|r post top %d (%s)", db.profile.topN, RC:PeriodName(db.profile.histPeriod)))
 			end,
 		})
-		LDBIcon:Register("RollCasino", obj, db.profile.minimap)
+		LDBIcon:Register("HiLoCasino", obj, db.profile.minimap)
 	end
 
 	self:RegisterChatCommand("rc", "SlashCmd")
-	self:RegisterChatCommand("rollcasino", "SlashCmd")
+	self:RegisterChatCommand("hilo", "SlashCmd")
+	self:RegisterChatCommand("hilocasino", "SlashCmd")
 end
 
 function RC:OnEnable()
@@ -1881,5 +1872,5 @@ function RC:OnEnable()
 	self:RegisterEvent("CHAT_MSG_CHANNEL",     "Chat_CHANNEL")
 	self:RegisterEvent("CHAT_MSG_SYSTEM",      "Chat_SYSTEM")
 
-	self:Print("|cffffff00Roll Casino|r loaded. Type |cff59f0dc/rc|r to open.")
+	self:Print("|cffffff00Hi-Lo Casino|r loaded. Type |cff59f0dc/hilo|r to open.")
 end

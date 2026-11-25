@@ -1,8 +1,8 @@
-<p align="center"><img src="media/logo.png" width="128" alt="Roll Casino logo"></p>
+<p align="center"><img src="media/logo.png" width="128" alt="Hi-Lo Casino logo"></p>
 
-# Roll Casino
+# Hi-Lo Casino
 
-Host Hi/Lo gold roll games in **WoW Forever**. Roll Casino announces the round, collects
+Host Hi/Lo gold roll games in **WoW Forever**. Hi-Lo Casino announces the round, collects
 entries from chat, reads everyone's `/roll`, works out who owes whom, and keeps a full
 history with leaderboards you can post to chat.
 
@@ -28,18 +28,20 @@ Post the **Top N**, **Bottom N** or a **Summary** to chat with one click.
 
 ## Commands
 
+Get it on [CurseForge](https://www.curseforge.com/wow/addons/hi-lo-casino) (project 1831355). Named *Roll Casino* before 2.2.0.
+
 | Command | |
 |---|---|
-| `/rc` | Toggle the window |
-| `/rc history` | Leaderboard and round log |
-| `/rc top [n] [period]` | Post the top *n* winners (period: `session`, `today`, `week`, `month`, `all`) |
-| `/rc bottom [n] [period]` | Post the *n* biggest losers |
-| `/rc summary [period]` | Post a summary of the period |
-| `/rc newsession` | Start a new "This session" |
-| `/rc next` / `/rc reset` | Advance / reset the current round |
-| `/rc gold <n>` / `/rc ratio <n>` | Stakes in gold / roll:gold ratio |
-| `/rc channel <name>` | Custom chat channel |
-| `/rc minimap` | Toggle the minimap button |
+| `/hilo` | Toggle the window (`/rc` works too) |
+| `/hilo history` | Leaderboard and round log |
+| `/hilo top [n] [period]` | Post the top *n* winners (period: `session`, `today`, `week`, `month`, `all`) |
+| `/hilo bottom [n] [period]` | Post the *n* biggest losers |
+| `/hilo summary [period]` | Post a summary of the period |
+| `/hilo newsession` | Start a new "This session" |
+| `/hilo next` / `/hilo reset` | Advance / reset the current round |
+| `/hilo gold <n>` / `/hilo ratio <n>` | Stakes in gold / roll:gold ratio |
+| `/hilo channel <name>` | Custom chat channel |
+| `/hilo minimap` | Toggle the minimap button |
 
 ## Looks
 

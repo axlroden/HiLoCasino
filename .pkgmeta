@@ -1,4 +1,7 @@
-package-as: RollCasino
+package-as: HiLoCasino
+
+# CurseForge project "Hi-Lo Casino" (also in HiLoCasino.toc).
+x-curse-project-id: 1831355
 
 manual-changelog:
   filename: CHANGELOG.md

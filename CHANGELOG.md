@@ -1,13 +1,15 @@
-# Roll Casino
+# Hi-Lo Casino
 
 ## 2.2.0
 
+- **Renamed to Hi-Lo Casino** (folder `HiLoCasino`, `/hilo`; `/rc` still works). Another WoW Forever addon already uses the Roll Casino name.
+
 - **History**: every finished round is saved (time, players and rolls, winners, losers, gold won or lost).
-- **History window** (`/rc history`, the History button, or shift-click the minimap icon):
+- **History window** (`/hilo history`, the History button, or shift-click the minimap icon):
   leaderboard (net gold, rounds, wins/losses, best and worst round) and a round log for
   *This session*, *Today*, *Last 7 days*, *Last 30 days* or *All time*. Hover a round for every roll.
 - **Post to chat**: Top N, Bottom N (3/5/10), a period summary, or any single round.
-  Also `/rc top [n] [period]`, `/rc bottom [n] [period]`, `/rc summary [period]`.
+  Also `/hilo top [n] [period]`, `/hilo bottom [n] [period]`, `/hilo summary [period]`.
 - **Clean-up**: delete single rounds, clear a whole period, or start a new session (two-click confirm).
 - Old running totals are imported once as "Imported totals" (All time only).
 - New logo.

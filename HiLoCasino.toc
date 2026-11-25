@@ -1,0 +1,16 @@
+## Interface: 16001
+## Title:|cFFFF7F7FH|cFFFFC47Fi|cFFFFFF7F-|cFF7FFF7FL|cFF7F7FFFo |cFFFF7FFFC|cFFFF7F7Fa|cFFFFC47Fs|cFFFFFF7Fi|cFF7FFF7Fn|cFF7F7FFFo
+## Author: Pytte
+## Version: 2.2.0
+## DefaultState: Enabled
+## Notes: Host Hi/Lo gold roll games: entries, rolls, payouts, history and leaderboards.
+## IconTexture: Interface\AddOns\HiLoCasino\media\icon
+## SavedVariables: HiLoCasinoDB
+## OptionalDeps: NaowhForever
+## X-Category: Chat/Communication
+## X-License: MIT
+## X-Website: https://github.com/axlroden/HiLoCasino
+## X-Curse-Project-ID: 1831355
+
+embeds.xml
+Core.lua
