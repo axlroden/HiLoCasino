@@ -1,0 +1,15 @@
+## Interface: 16001
+## Title:|cFFFF7F7FR|cFFFFC47Fo|cFFFFFF7Fl|cFF7FFF7Fl|cFF7F7FFFC|cFFFF7FFFa|cFFFF7F7Fs|cFFFFC47Fi|cFFFFFF7Fn|cFF7FFF7Fo
+## Author: Pytte
+## Version: 2.2.0
+## DefaultState: Enabled
+## Notes: Host Hi/Lo gold roll games: entries, rolls, payouts, history and leaderboards.
+## IconTexture: Interface\AddOns\RollCasino\media\icon
+## SavedVariables: RollCasinoDB, RollCasino
+## OptionalDeps: NaowhForever
+## X-Category: Chat/Communication
+## X-License: MIT
+## X-Website: https://github.com/axlroden/RollCasino
+
+embeds.xml
+Core.lua
