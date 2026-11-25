@@ -1,5 +1,18 @@
 # Hi-Lo Casino
 
+## 2.3.0
+
+- **Settings panel** (Options → AddOns → Hi-Lo Casino, the gear button in both windows,
+  Ctrl-click the minimap icon, or `/hilo options`): stakes, ratio, broadcast channel,
+  enter/withdraw keywords, history period and post count, window scale, minimap button,
+  lock windows, click sounds, login message, reset window positions.
+- `/hilo next` during rolling no longer pushes the round past its last phase.
+- A first roll equal to the maximum now counts as the low roll too.
+- A Lua error while working out payouts can no longer leave chat stuck in "queue for later" mode.
+- Secret chat values are checked before any comparison.
+- Code cleanup: about 15% shorter, windows and lists share one set of building blocks;
+  the entrant list and buttons only redraw while the window is open.
+
 ## 2.2.0
 
 - **Renamed to Hi-Lo Casino** (folder `HiLoCasino`, `/hilo`; `/rc` still works). Another WoW Forever addon already uses the Roll Casino name.

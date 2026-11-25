@@ -1,184 +1,195 @@
 --[[ Hi-Lo Casino  (named Roll Casino before 2.2.0)
-     Original author: Pytte
-     2.0 rewrite: Ace3 (AceAddon / AceDB / LibDBIcon)
-     2.1: hand-built window in the NaowhForever house look (follows its
-          live theme and fonts when NaowhForever is loaded).
-     Game logic preserved 1:1 from the original 1.3.1 release.
+     Host Hi/Lo gold roll games: entries, rolls, payouts, per-round history,
+     leaderboards and chat posts. Original author: Pytte.
+     The windows follow NaowhForever's live theme and fonts when it is loaded.
 --]]
 
 local ADDON = ...
-
 local RC      = LibStub("AceAddon-3.0"):NewAddon("HiLoCasino", "AceConsole-3.0", "AceEvent-3.0")
 local LDB     = LibStub("LibDataBroker-1.1", true)
 local LDBIcon = LibStub("LibDBIcon-1.0", true)
 
-local format, floor, tonumber, tostring = string.format, math.floor, tonumber, tostring
-local strsplit, strlower, strsub = strsplit, strlower, string.sub
-local tinsert, tgetn = table.insert, function(t) return #t end
+local format, floor, max, min = string.format, math.floor, math.max, math.min
+local tinsert, concat, strlower = table.insert, table.concat, strlower
 
 --==========================================================================
---  STATE
+--  CONSTANTS AND STATE
 --==========================================================================
 
--- Roll-to-gold ratio: roll cap = gold * ratio, displayed gold = roll / ratio.
--- Selectable in the UI. e.g. 100:1 -> 20g gambles with a /roll 1-2000.
-local RATIO_OPTIONS = { [1] = "1 : 1", [10] = "10 : 1", [100] = "100 : 1", [1000] = "1000 : 1" }
-local RATIO_ORDER   = { 1, 10, 100, 1000 }
+-- Roll cap = gold * ratio; e.g. 100 : 1 turns 20g stakes into /roll 1-2000.
+local RATIOS = { { 1, "1 : 1" }, { 10, "10 : 1" }, { 100, "100 : 1" }, { 1000, "1000 : 1" } }
+local CHATS = { { "SAY", "Say" }, { "PARTY", "Party" }, { "RAID", "Raid" }, { "GUILD", "Guild" }, { "CHANNEL", "Custom Channel" } }
+local PERIODS = { { "session", "This session" }, { "today", "Today" }, { "week", "Last 7 days" },
+	{ "month", "Last 30 days" }, { "all", "All time" } }
+local TOP_COUNTS = { { 3, "Top 3" }, { 5, "Top 5" }, { 10, "Top 10" } }
+local SCALES = { { 0.8, "80%" }, { 0.9, "90%" }, { 1, "100%" }, { 1.1, "110%" }, { 1.25, "125%" } }
+local PHASE_BUTTON = { [0] = "Start Round", "Announce Last Call", "Begin Rolling", "Waiting for rolls..." }
+local PHASE_NAME = { [0] = "Idle", "Entry open", "Last call", "Rolling" }
+local MAX_ROUNDS, DAY = 5000, 86400
 
-local CHAT_METHODS = { "SAY", "PARTY", "RAID", "GUILD", "CHANNEL" }
-local CHAT_LABELS  = {
-	SAY     = "Say",
-	PARTY   = "Party",
-	RAID    = "Raid",
-	GUILD   = "Guild",
-	CHANNEL = "Custom Channel",
-}
-
-local PHASE_LABELS = {
-	[0] = "Start Round",
-	[1] = "Announce Last Call",
-	[2] = "Begin Rolling",
-	[3] = "Waiting for rolls...",
-}
+local function Label(list, value)
+	for _, o in ipairs(list) do if o[1] == value then return o[2] end end
+	return tostring(value)
+end
 
 local defaults = {
-	global  = {
-		allTime = {},          -- pre-2.2 running totals (roll units); imported into rounds once
-		rounds  = {},          -- one record per finished round (see RC:ReportResults)
+	global = {
+		allTime = {},      -- pre-2.2 running totals (roll units); imported into rounds once
+		rounds  = {},      -- one record per finished round (see RC:ReportResults)
 	},
 	profile = {
-		enterMsg      = "1",
-		withdrawMsg   = "-1",
-		chatMethod    = "RAID",
-		customChannel = "hilocasino",
-		stakesGold    = 20,        -- gold the host wants to gamble for
-		ratio         = 100,       -- roll cap = stakesGold * ratio
-		rulesName     = "Hi/Lo",
-		minimap       = { hide = false },
-		histPeriod    = "session", -- period for overviews and the quick post buttons
-		topN          = 5,         -- how many players "Top"/"Bottom" posts list
+		enterMsg = "1", withdrawMsg = "-1",
+		chatMethod = "RAID", customChannel = "hilocasino",
+		stakesGold = 20, ratio = 100, rulesName = "Hi/Lo",
+		histPeriod = "session", topN = 5,          -- overviews and the quick post buttons
+		minimap = { hide = false },
+		scale = 1, lockWindows = false, clickSound = true, loginMessage = true,
 	},
 }
 
-local db                 -- AceDB
-local round              -- current round table
-local personalEntered = false
-local personalRolled  = false
+local db, round
+local personalEntered, personalRolled = false, false
+-- Chat lines an event handler may not send (Say outdoors, custom channels);
+-- posted by the "Announce Results" click.
+local pendingMsgs, deferChat
+local sessionStart = time()   -- "This session" = since login, or since "New session"
 
--- Chat lines that could not be sent from an event handler (Say outdoors and
--- custom channels need a real click/keypress); posted by "Announce Results".
-local pendingMsgs
-local deferChat = false
-
--- Chat payloads can be "secret" on newer clients (chat messaging lockdown);
--- comparing a secret string errors, so such messages are skipped.
+-- Chat payloads can be secret on this client (chat messaging lockdown);
+-- touching a secret string errors, so such messages are skipped.
 local issecret = issecretvalue or function() return false end
-
 local SendChat = (C_ChatInfo and C_ChatInfo.SendChatMessage) or SendChatMessage
 
-local function NewRound()
-	return {
-		phase         = 0,
-		stakes        = 0,
-		entrants      = {},
-		entrantsCount = 0,
-		acceptEntries = false,
-		acceptRolls   = false,
-		highRoller    = nil,
-		lowRoller     = nil,
-		highTyers     = {},
-		lowTyers      = {},
-	}
+local function Version()
+	return (C_AddOns and C_AddOns.GetAddOnMetadata or GetAddOnMetadata)(ADDON, "Version") or ""
+end
+
+local function NewRound(stakes)
+	return { phase = 0, stakes = stakes or 0, entrants = {}, entrantsCount = 0, highTyers = {}, lowTyers = {} }
 end
 
 --==========================================================================
 --  HELPERS
 --==========================================================================
 
-local function has_value(arr, val)
-	for _, v in ipairs(arr) do
-		if v == val then return true end
-	end
+local function Contains(list, v)
+	for _, x in ipairs(list) do if x == v then return true end end
 	return false
 end
 
-local function CurrentRatio()
-	return (db and db.profile and db.profile.ratio) or 100
-end
+local function Plural(n, one, many) return n == 1 and one or many end
+
+local function CurrentRatio() return db and db.profile.ratio or 100 end
 
 local function ConvertRollToGold(value)
 	return format("%sg", floor((tonumber(value) or 0) / CurrentRatio()))
 end
 
+-- 1234 -> "1,234g"; signed adds "+" to gains.
+local function Gold(n, signed)
+	n = n or 0
+	local digits = tostring(floor(math.abs(n) + 0.5)):reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+	return (n < 0 and "-" or (signed and n > 0 and "+" or "")) .. digits .. "g"
+end
+
+local function Trim(s) return s and (s:gsub("^%s+", ""):gsub("%s+$", "")) or "" end
+
+function RC:RollCap()
+	return max(1, floor((db.profile.stakesGold or 1) * CurrentRatio()))
+end
+
+-- ok, channel number; warns and returns nil when the custom channel isn't joined.
+local function ChannelTarget(self)
+	if db.profile.chatMethod ~= "CHANNEL" then return true end
+	local n = GetChannelName(db.profile.customChannel)
+	if n and n ~= 0 then return true, n end
+	self:Print("|cffff5555Custom channel '" .. db.profile.customChannel .. "' not joined.|r")
+end
+
+-- Say/Yell outside instances and custom channels can only be sent from a
+-- click or keypress, never from an event handler.
+function RC:NeedsHardwareEvent()
+	local m = db.profile.chatMethod
+	return m == "CHANNEL" or ((m == "SAY" or m == "YELL") and not IsInInstance())
+end
+
 function RC:ChatMsg(msg)
-	local method = db.profile.chatMethod
-	local channelNum
-	if method == "CHANNEL" then
-		channelNum = GetChannelName(db.profile.customChannel)
-		if not channelNum or channelNum == 0 then
-			self:Print("|cffff5555Custom channel '"..db.profile.customChannel.."' not joined.|r")
-			return
-		end
-	end
-	-- SendChatMessage treats a lone '|' as the start of an escape code and
-	-- rejects the whole message; escape any literal pipes to '||'.
+	local ok, channel = ChannelTarget(self)
+	if not ok then return end
+	-- SendChatMessage rejects a lone '|' (escape code start); double them.
 	msg = tostring(msg):gsub("|", "||")
 	if deferChat and self:NeedsHardwareEvent() then
 		pendingMsgs = pendingMsgs or {}
 		tinsert(pendingMsgs, msg)
-		return
+	else
+		SendChat(msg, db.profile.chatMethod, nil, channel)
 	end
-	SendChat(msg, method, nil, channelNum)
-end
-
--- Say/Yell outside instances and custom channels can only be sent from a
--- click or keypress, not from an event handler.
-function RC:NeedsHardwareEvent()
-	local method = db.profile.chatMethod
-	if method == "CHANNEL" then return true end
-	if method == "SAY" or method == "YELL" then
-		local inInstance = IsInInstance()
-		return not inInstance
-	end
-	return false
 end
 
 function RC:FlushPending()
 	if not pendingMsgs then return false end
-	local method, channelNum = db.profile.chatMethod, nil
-	if method == "CHANNEL" then
-		channelNum = GetChannelName(db.profile.customChannel)
-		if not channelNum or channelNum == 0 then
-			self:Print("|cffff5555Custom channel '"..db.profile.customChannel.."' not joined.|r")
-			return true
-		end
+	local ok, channel = ChannelTarget(self)
+	if ok then
+		local msgs = pendingMsgs
+		pendingMsgs = nil
+		for _, m in ipairs(msgs) do SendChat(m, db.profile.chatMethod, nil, channel) end
+		self:RefreshControls()
 	end
-	local msgs = pendingMsgs
-	pendingMsgs = nil
-	for _, m in ipairs(msgs) do
-		SendChat(m, method, nil, channelNum)   -- already pipe-escaped in ChatMsg
-	end
-	self:RefreshControls()
 	return true
 end
 
--- The actual /roll cap = gold amount * ratio.
-function RC:RollCap()
-	return math.max(1, floor((db.profile.stakesGold or 1) * CurrentRatio()))
+--==========================================================================
+--  SETTINGS  (one entry point for the window, the options panel and /hilo)
+--==========================================================================
+
+local function Number(min_)
+	return function(v)
+		v = tonumber(v)
+		if v and v >= min_ then return floor(v) end
+	end
+end
+local function Text_(v) v = Trim(v); if v ~= "" then return v end end
+
+local VALIDATE = {
+	stakesGold = Number(1), ratio = Number(1),
+	customChannel = Text_, enterMsg = Text_, withdrawMsg = Text_,
+}
+
+function RC:Set(key, value)
+	if VALIDATE[key] then value = VALIDATE[key](value) end
+	if value == nil then return false end
+	db.profile[key] = value
+	self:ApplySettings()
+	return true
+end
+
+function RC:SetMinimapShown(shown)
+	db.profile.minimap.hide = not shown
+	self:ApplySettings()
+end
+
+local RepaintAll   -- defined with the UI kit
+
+function RC:ApplySettings()
+	if round and round.phase == 0 then round.stakes = self:RollCap() end
+	if LDBIcon then
+		if db.profile.minimap.hide then LDBIcon:Hide("HiLoCasino") else LDBIcon:Show("HiLoCasino") end
+	end
+	if RepaintAll then RepaintAll() end   -- scale, theme, fonts
+	self:RebuildGameGroup()
+	self:RefreshHistory()
+	if self.options then self.options:Refresh() end
 end
 
 --==========================================================================
---  ROLL / ENTRANT TRACKING (ported logic)
+--  ENTRANTS AND ROLLS
 --==========================================================================
 
 function RC:GetHighRoll()
-	if not round.highRoller then return 0 end
-	return round.entrants[round.highRoller].roll
+	return round.highRoller and round.entrants[round.highRoller].roll or 0
 end
 
 function RC:GetLowRoll()
-	if not round.lowRoller then return round.stakes end
-	return round.entrants[round.lowRoller].roll
+	return round.lowRoller and round.entrants[round.lowRoller].roll or round.stakes
 end
 
 function RC:GetRemainingToRollCount()
@@ -189,142 +200,82 @@ function RC:GetRemainingToRollCount()
 	return count
 end
 
--- WoW Forever character names contain a space ("Pytte Soulreaper"), which
--- chat senders may carry as a hyphen ("Pytte-Soulreaper"), and cross-realm
--- names add "-Realm". Entrants are keyed by a normalized form: hyphens as
--- spaces, single-spaced, lower case. The display name is kept separately.
+-- WoW Forever names contain a space ("Pytte Soulreaper"), chat senders may
+-- carry it as a hyphen, and cross-realm names add "-Realm". Entrants are keyed
+-- by a normalized form (hyphens as spaces, single-spaced, lower case).
 local function DisplayName(name)
-	name = name:gsub("%-", " "):gsub("%s+", " ")
-	name = name:gsub("^ ", ""):gsub(" $", "")
-	return name
+	return (name:gsub("%-", " "):gsub("%s+", " "):gsub("^ ", ""):gsub(" $", ""))
 end
 
-local function NameKey(name)
-	return DisplayName(name):lower()
-end
+local function NameKey(name) return DisplayName(name):lower() end
 
--- Entrant key for a name from a roll line: exact match first, then a match
--- that differs only by a trailing realm on either side.
+-- Exact match first, then one that differs only by a trailing realm.
 local function FindEntrantKey(name)
 	local key = NameKey(name)
 	if round.entrants[key] then return key end
 	for k in pairs(round.entrants) do
-		if k:sub(1, #key + 1) == key .. " " or key:sub(1, #k + 1) == k .. " " then
-			return k
-		end
+		if k:sub(1, #key + 1) == key .. " " or key:sub(1, #k + 1) == k .. " " then return k end
 	end
-	return nil
-end
-
-function RC:AddPlayer(name)
-	if not name or name == "" then return end
-	local key = NameKey(name)
-	if round.entrants[key] == nil then
-		round.entrants[key] = { key = key, name = DisplayName(name), rolled = false, roll = -1, entered = true }
-		round.entrantsCount = round.entrantsCount + 1
-	else
-		round.entrants[key].entered = true
-	end
-	self:UpdateActionList()
-	self:RefreshControls()
-end
-
-function RC:WithdrawPlayer(name)
-	if not name or name == "" then return end
-	local key = NameKey(name)
-	if round.entrants[key] == nil then return end
-	round.entrants[key].entered = false
-	self:UpdateActionList()
 end
 
 function RC:ParseEntry(msg, name)
-	if msg == db.profile.enterMsg then
-		self:AddPlayer(name)
-	elseif msg == db.profile.withdrawMsg then
-		self:WithdrawPlayer(name)
+	local enter = msg == db.profile.enterMsg
+	if not (enter or msg == db.profile.withdrawMsg) or not name or name == "" then return end
+	local key = NameKey(name)
+	local e = round.entrants[key]
+	if e then
+		e.entered = enter
+	elseif enter then
+		round.entrants[key] = { key = key, name = DisplayName(name), roll = -1, entered = true }
+		round.entrantsCount = round.entrantsCount + 1
+	else
+		return
 	end
+	self:UpdateActionList()
+	self:RefreshControls()
 end
 
--- Lua pattern for the system roll line, built from the client's own
--- RANDOM_ROLL_RESULT ("%s rolls %d (%d-%d)") so it follows the client's text;
--- captures name, roll, min, max.
-local ROLL_PATTERN
-do
-	local fmt = RANDOM_ROLL_RESULT
-	if type(fmt) == "string" and fmt:find("%%s") then
-		local p = fmt:gsub("([%(%)%.%+%-%*%?%[%]%^%$])", "%%%1")
-		p = p:gsub("%%%d*%$?s", "(.+)")
-		p = p:gsub("%%%d*%$?d", "(%%d+)")
-		ROLL_PATTERN = "^" .. p .. "$"
-	else
-		ROLL_PATTERN = "^(.+) rolls (%d+) %((%d+)%-(%d+)%)$"
-	end
+-- Pattern for the system roll line, built from the client's own
+-- RANDOM_ROLL_RESULT ("%s rolls %d (%d-%d)"); captures name, roll, min, max.
+local ROLL_PATTERN = "^(.+) rolls (%d+) %((%d+)%-(%d+)%)$"
+if type(RANDOM_ROLL_RESULT) == "string" and RANDOM_ROLL_RESULT:find("%%s") then
+	ROLL_PATTERN = "^" .. RANDOM_ROLL_RESULT:gsub("([%(%)%.%+%-%*%?%[%]%^%$])", "%%%1")
+		:gsub("%%%d*%$?s", "(.+)"):gsub("%%%d*%$?d", "(%%d+)") .. "$"
 end
 
 function RC:ParseRoll(msg)
-	local playerName, roll, minRoll, maxRoll = msg:match(ROLL_PATTERN)
-	if not playerName then return end
+	local name, roll, lo, hi = msg:match(ROLL_PATTERN)
+	if not name then return end
+	local key = FindEntrantKey(name)
+	local p = key and round.entrants[key]
+	roll, lo, hi = tonumber(roll), tonumber(lo), tonumber(hi)
+	if not p or not p.entered or p.rolled or lo ~= 1 or hi ~= round.stakes or not roll or roll > hi then return end
 
-	local key = FindEntrantKey(playerName)
-	local player = key and round.entrants[key]
-	if player == nil or not player.entered or player.rolled then
-		return
+	p.rolled, p.roll, p.name = true, roll, DisplayName(name)   -- the name as the game prints it
+	local high, low = self:GetHighRoll(), self:GetLowRoll()
+	if not round.highRoller or roll > high then
+		round.highRoller, round.highTyers = key, { key }
+	elseif roll == high then
+		tinsert(round.highTyers, key)
+	end
+	if not round.lowRoller or roll < low then
+		round.lowRoller, round.lowTyers = key, { key }
+	elseif roll == low then
+		tinsert(round.lowTyers, key)
 	end
 
-	minRoll = tonumber(minRoll)
-	maxRoll = tonumber(maxRoll)
-	roll    = tonumber(roll)
-
-	if minRoll ~= 1 or maxRoll ~= round.stakes or not roll or roll > maxRoll or roll < minRoll then
-		return
-	end
-
-	player.rolled = true
-	player.roll   = roll
-	player.name   = DisplayName(playerName)   -- the name exactly as the game prints it
-	playerName    = key                       -- high/low trackers hold entrant keys
-
-	if roll > self:GetHighRoll() then
-		round.highRoller = playerName
-		round.highTyers  = { playerName }
-	elseif roll == self:GetHighRoll() then
-		tinsert(round.highTyers, playerName)
-	end
-
-	if roll < self:GetLowRoll() then
-		round.lowRoller = playerName
-		round.lowTyers  = { playerName }
-	elseif roll == self:GetLowRoll() then
-		tinsert(round.lowTyers, playerName)
-	end
-
-	if self:GetRemainingToRollCount() == 0 then
-		self:RoundWrapup()
-	end
-
+	if self:GetRemainingToRollCount() == 0 then self:RoundWrapup() end
 	self:UpdateActionList()
 	self:RefreshControls()
 end
 
 --==========================================================================
---  HISTORY  (every finished round is stored; all overviews and chat posts
---  are computed from those records, in gold, for any period)
+--  HISTORY  (every finished round is stored; overviews and chat posts are
+--  computed from those records, in gold, for any period)
 --==========================================================================
 
-local MAX_ROUNDS = 5000
-local DAY = 86400
-
-local PERIODS = {
-	{ "session", "This session" },
-	{ "today",   "Today" },
-	{ "week",    "Last 7 days" },
-	{ "month",   "Last 30 days" },
-	{ "all",     "All time" },
-}
 local PERIOD_LABEL = {}
 for _, p in ipairs(PERIODS) do PERIOD_LABEL[p[1]] = p[2] end
-
-local sessionStart = time()   -- "This session" = since login, or since "New session"
 
 local function Rounds()
 	db.global.rounds = db.global.rounds or {}
@@ -336,74 +287,54 @@ local function InPeriod(rec, period)
 	if rec.legacy then return false end          -- imported pre-2.2 totals: all time only
 	local t = rec.t or 0
 	if period == "session" then return t >= sessionStart end
-	if period == "today"   then return date("%Y%m%d", t) == date("%Y%m%d") end
-	if period == "week"    then return t >= time() - 7 * DAY end
-	if period == "month"   then return t >= time() - 30 * DAY end
+	if period == "today" then return date("%Y%m%d", t) == date("%Y%m%d") end
+	if period == "week" then return t >= time() - 7 * DAY end
+	if period == "month" then return t >= time() - 30 * DAY end
 	return true
 end
 
--- 1234 -> "1,234g"; signed adds "+" to gains.
-local function Gold(n, signed)
-	n = n or 0
-	local neg = n < 0
-	local digits = tostring(floor(math.abs(n) + 0.5))
-	digits = (digits:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", ""))
-	local sign = neg and "-" or ((signed and n > 0) and "+" or "")
-	return sign .. digits .. "g"
-end
+function RC:PeriodName(period) return PERIOD_LABEL[period] or PERIOD_LABEL.session end
 
-local function Plural(n, one, many) return n == 1 and one or many end
+local function NoRounds(self, period)
+	self:Print("No rounds recorded for " .. self:PeriodName(period) .. ".")
+end
 
 function RC:RecordRound(rec)
 	local rounds = Rounds()
 	tinsert(rounds, rec)
-	while #rounds > MAX_ROUNDS do
-		local drop = rounds[1].legacy and 2 or 1     -- never drop the imported totals
-		table.remove(rounds, drop)
-	end
-	if self.RefreshHistory then self:RefreshHistory() end
+	while #rounds > MAX_ROUNDS do table.remove(rounds, rounds[1].legacy and 2 or 1) end   -- keep imported totals
+	self:RefreshHistory()
 end
 
--- Per-player overview for a period, best net first, plus period totals.
+-- Per-player overview for a period (best net first) plus period totals.
 function RC:Aggregate(period)
 	local players, order = {}, {}
-	local totals = { rounds = 0, ties = 0, moved = 0, biggest = nil }
+	local totals = { rounds = 0, ties = 0, moved = 0 }
 	local function P(name)
 		local key = strlower(name)
-		local p = players[key]
-		if not p then
-			p = { name = name, net = 0, rounds = 0, wins = 0, losses = 0, best = 0, worst = 0 }
-			players[key] = p
-			order[#order + 1] = p
+		if not players[key] then
+			players[key] = { name = name, net = 0, rounds = 0, wins = 0, losses = 0, best = 0, worst = 0 }
+			order[#order + 1] = players[key]
 		end
-		return p
+		return players[key]
 	end
 	for _, rec in ipairs(Rounds()) do
 		if InPeriod(rec, period) then
-			if rec.legacy then
-				for name, d in pairs(rec.deltas or {}) do
-					local p = P(name)
-					p.net, p.imported = p.net + d, true
-				end
-			else
+			if not rec.legacy then
 				totals.rounds = totals.rounds + 1
 				if rec.tie then totals.ties = totals.ties + 1 end
-				for _, pl in ipairs(rec.players or {}) do
-					local p = P(pl.n)
-					p.rounds = p.rounds + 1
-				end
-				for name, d in pairs(rec.deltas or {}) do
-					local p = P(name)
-					p.net = p.net + d
-					if d > 0 then
-						p.wins, p.best = p.wins + 1, math.max(p.best, d)
-						totals.moved = totals.moved + d
-					elseif d < 0 then
-						p.losses, p.worst = p.losses + 1, math.min(p.worst, d)
-					end
-				end
+				for _, pl in ipairs(rec.players or {}) do local p = P(pl.n); p.rounds = p.rounds + 1 end
 				if rec.each and rec.each > 0 and (not totals.biggest or rec.each > totals.biggest.each) then
 					totals.biggest = rec
+				end
+			end
+			for name, d in pairs(rec.deltas or {}) do
+				local p = P(name)
+				p.net = p.net + d
+				if not rec.legacy and d > 0 then
+					p.wins, p.best, totals.moved = p.wins + 1, max(p.best, d), totals.moved + d
+				elseif not rec.legacy and d < 0 then
+					p.losses, p.worst = p.losses + 1, min(p.worst, d)
 				end
 			end
 		end
@@ -415,65 +346,42 @@ function RC:Aggregate(period)
 	return order, totals
 end
 
-function RC:PeriodName(period) return PERIOD_LABEL[period] or PERIOD_LABEL.session end
+local function Each(rec) return #(rec.losers or {}) + #(rec.winners or {}) > 2 end
+
+local function RoundResult(rec)
+	if rec.tie then return "Tie - no payout" end
+	return format("%s owes %s %s%s", concat(rec.losers or {}, ", "), concat(rec.winners or {}, ", "),
+		Gold(rec.each), Each(rec) and " each" or "")
+end
 
 -- which = "top" (biggest winners) or "bottom" (biggest losers).
 function RC:PostLeaderboard(which, n, period)
-	period = period or db.profile.histPeriod
-	n = n or db.profile.topN
+	period, n = period or db.profile.histPeriod, n or db.profile.topN
 	local order = self:Aggregate(period)
-	local list = {}
-	if which == "bottom" then
-		for i = #order, 1, -1 do
-			if #list >= n then break end
-			list[#list + 1] = order[i]
-		end
-	else
-		for i = 1, #order do
-			if #list >= n then break end
-			list[#list + 1] = order[i]
-		end
-	end
-	if #list == 0 then
-		self:Print("No rounds recorded for " .. self:PeriodName(period) .. ".")
-		return
-	end
-	self:ChatMsg(format(".:HiLo %s %d - %s:.", which == "bottom" and "Bottom" or "Top", #list, self:PeriodName(period)))
-	for i, p in ipairs(list) do
-		local detail
-		if p.rounds == 0 then
-			detail = "imported"
-		else
-			detail = format("%d %s, %dW/%dL", p.rounds, Plural(p.rounds, "round", "rounds"), p.wins, p.losses)
-		end
+	if #order == 0 then return NoRounds(self, period) end
+	local count = min(n, #order)
+	self:ChatMsg(format(".:HiLo %s %d - %s:.", which == "bottom" and "Bottom" or "Top", count, self:PeriodName(period)))
+	for i = 1, count do
+		local p = order[which == "bottom" and #order - i + 1 or i]
+		local detail = p.rounds == 0 and "imported"
+			or format("%d %s, %dW/%dL", p.rounds, Plural(p.rounds, "round", "rounds"), p.wins, p.losses)
 		self:ChatMsg(format("%d. %s  %s  (%s)", i, p.name, Gold(p.net, true), detail))
 	end
 end
 
-local function RoundResult(rec)
-	if rec.tie then return "Tie - no payout" end
-	return format("%s owes %s %s%s", table.concat(rec.losers or {}, ", "), table.concat(rec.winners or {}, ", "),
-		Gold(rec.each), (#(rec.losers or {}) + #(rec.winners or {}) > 2) and " each" or "")
-end
-
 function RC:PostSummary(period)
 	period = period or db.profile.histPeriod
-	local order, totals = self:Aggregate(period)
-	if totals.rounds == 0 and #order == 0 then
-		self:Print("No rounds recorded for " .. self:PeriodName(period) .. ".")
-		return
-	end
-	self:ChatMsg(format(".:HiLo Stats - %s:. %d %s (%d %s), %s changed hands",
-		self:PeriodName(period), totals.rounds, Plural(totals.rounds, "round", "rounds"),
-		totals.ties, Plural(totals.ties, "tie", "ties"), Gold(totals.moved)))
-	if totals.biggest then
-		self:ChatMsg(format(".:HiLo:. Biggest round: %s (%s)", RoundResult(totals.biggest),
-			date("%d %b %H:%M", totals.biggest.t)))
+	local order, t = self:Aggregate(period)
+	if t.rounds == 0 and #order == 0 then return NoRounds(self, period) end
+	self:ChatMsg(format(".:HiLo Stats - %s:. %d %s (%d %s), %s changed hands", self:PeriodName(period),
+		t.rounds, Plural(t.rounds, "round", "rounds"), t.ties, Plural(t.ties, "tie", "ties"), Gold(t.moved)))
+	if t.biggest then
+		self:ChatMsg(format(".:HiLo:. Biggest round: %s (%s)", RoundResult(t.biggest), date("%d %b %H:%M", t.biggest.t)))
 	end
 	local top, bottom = order[1], order[#order]
 	if top and top.net > 0 then
-		self:ChatMsg(format(".:HiLo:. Luckiest: %s %s  -  Unluckiest: %s %s", top.name, Gold(top.net, true),
-			bottom.name, Gold(bottom.net, true)))
+		self:ChatMsg(format(".:HiLo:. Luckiest: %s %s  -  Unluckiest: %s %s",
+			top.name, Gold(top.net, true), bottom.name, Gold(bottom.net, true)))
 	end
 end
 
@@ -482,15 +390,21 @@ function RC:PostRound(rec)
 	local rolls = {}
 	for _, pl in ipairs(rec.players or {}) do rolls[#rolls + 1] = pl.n .. " " .. pl.r end
 	self:ChatMsg(format(".:HiLo Round %s:. %s", date("%H:%M", rec.t), RoundResult(rec)))
-	if #rolls > 0 then self:ChatMsg(".:HiLo:. Rolls: " .. table.concat(rolls, ", ")) end
+	if #rolls > 0 then self:ChatMsg(".:HiLo:. Rolls: " .. concat(rolls, ", ")) end
+end
+
+-- Removes the given record, or every record in a period; returns how many.
+local function RemoveRounds(match)
+	local rounds, removed = Rounds(), 0
+	for i = #rounds, 1, -1 do
+		if match(rounds[i]) then table.remove(rounds, i); removed = removed + 1 end
+	end
+	return removed
 end
 
 function RC:DeleteRound(rec)
-	local rounds = Rounds()
-	for i = #rounds, 1, -1 do
-		if rounds[i] == rec then table.remove(rounds, i) break end
-	end
-	if self.RefreshHistory then self:RefreshHistory() end
+	RemoveRounds(function(r) return r == rec end)
+	self:RefreshHistory()
 end
 
 function RC:CountPeriod(period)
@@ -500,31 +414,20 @@ function RC:CountPeriod(period)
 end
 
 function RC:ClearPeriod(period)
-	local rounds, removed = Rounds(), 0
-	for i = #rounds, 1, -1 do
-		if InPeriod(rounds[i], period) then
-			table.remove(rounds, i)
-			removed = removed + 1
-		end
-	end
+	local removed = RemoveRounds(function(r) return InPeriod(r, period) end)
 	self:Print(format("Deleted %d %s (%s).", removed, Plural(removed, "round", "rounds"), self:PeriodName(period)))
-	if self.RefreshHistory then self:RefreshHistory() end
+	self:RefreshHistory()
 end
 
 function RC:NewSession()
 	sessionStart = time()
 	self:Print("New session started - \"This session\" counts from now. History is kept.")
-	if self.RefreshHistory then self:RefreshHistory() end
+	self:RefreshHistory()
 	self:RefreshControls()
 end
 
--- Older entry points (minimap right-click, old buttons) map onto history.
-function RC:BroadcastSessionStats() self:PostLeaderboard("top", nil, "session") end
-function RC:BroadcastAllTimeStats() self:PostLeaderboard("top", nil, "all") end
-function RC:ResetSessionStats() self:NewSession() end
-
 --==========================================================================
---  RULES / RESULTS
+--  ROUND FLOW
 --==========================================================================
 
 function RC:PrintRules()
@@ -534,146 +437,84 @@ function RC:PrintRules()
 end
 
 function RC:ReportResults()
-	local highRoll = self:GetHighRoll()
-	local lowRoll  = self:GetLowRoll()
-	local goldOwed = highRoll - lowRoll
-	local splitCount = #round.lowTyers + #round.highTyers - 1
-	if splitCount < 1 then splitCount = 1 end
-	goldOwed = goldOwed / splitCount
-
-	-- The history record for this round (gold, as announced).
+	local high, low = self:GetHighRoll(), self:GetLowRoll()
+	local split = max(1, #round.lowTyers + #round.highTyers - 1)
+	local owed = (high - low) / split
 	local rec = { t = time(), cap = round.stakes, ratio = CurrentRatio(), players = {}, deltas = {} }
 	for _, v in pairs(round.entrants) do
 		if v.entered and v.rolled then tinsert(rec.players, { n = v.name, r = v.roll }) end
 	end
 	table.sort(rec.players, function(a, b) return a.r > b.r end)
 
-	if goldOwed ~= 0 and highRoll > 0 and lowRoll > 0 then
-		-- Trackers hold entrant keys; chat and stats use the display names.
-		local function nameOf(key) return round.entrants[key] and round.entrants[key].name or key end
-		local each = floor(goldOwed / CurrentRatio())   -- same figure ConvertRollToGold announces
-		rec.each, rec.winners, rec.losers = each, {}, {}
-
-		local lowNames = nameOf(round.lowRoller)
-		tinsert(rec.losers, lowNames)
-		for idx = 2, #round.lowTyers do
-			local n = nameOf(round.lowTyers[idx])
-			lowNames = lowNames .. ", " .. n
-			tinsert(rec.losers, n)
-		end
-
-		local highNames = nameOf(round.highRoller)
-		tinsert(rec.winners, highNames)
-		for idx = 2, #round.highTyers do
-			local n = nameOf(round.highTyers[idx])
-			highNames = highNames .. ", " .. n
-			tinsert(rec.winners, n)
-		end
-
-		for _, n in ipairs(rec.losers)  do rec.deltas[n] = (rec.deltas[n] or 0) - each end
+	if owed ~= 0 and high > 0 and low > 0 then
+		local each = floor(owed / CurrentRatio())   -- the figure ConvertRollToGold announces
+		rec.each, rec.losers, rec.winners = each, {}, {}
+		for _, k in ipairs(round.lowTyers) do tinsert(rec.losers, round.entrants[k].name) end
+		for _, k in ipairs(round.highTyers) do tinsert(rec.winners, round.entrants[k].name) end
+		for _, n in ipairs(rec.losers) do rec.deltas[n] = (rec.deltas[n] or 0) - each end
 		for _, n in ipairs(rec.winners) do rec.deltas[n] = (rec.deltas[n] or 0) + each end
-
-		local msg = format("%s owes %s < %s >", lowNames, highNames, ConvertRollToGold(goldOwed))
-		if splitCount > 1 then msg = msg .. " each." end
-		self:ChatMsg(format(".:HiLo Payouts:. %s", msg))
+		self:ChatMsg(format(".:HiLo Payouts:. %s owes %s < %s >%s", concat(rec.losers, ", "),
+			concat(rec.winners, ", "), ConvertRollToGold(owed), split > 1 and " each." or ""))
 	else
 		rec.tie = true
 		self:ChatMsg(".:HiLo:. TIE! No payouts on this roll!")
 	end
-
 	self:RecordRound(rec)
 end
 
---==========================================================================
---  ROUND STATE MACHINE
---==========================================================================
-
 function RC:ResetRound()
-	round = NewRound()
-	round.stakes = self:RollCap()
-	personalEntered = false
-	personalRolled  = false
+	round = NewRound(self:RollCap())
+	personalEntered, personalRolled = false, false
 	self:UpdateActionList()
 	self:RefreshControls()
-end
-
-function RC:StartRound()
-	personalEntered     = false
-	personalRolled      = false
-	round.stakes        = self:RollCap()
-	round.entrants      = {}
-	round.entrantsCount = 0
-	round.highRoller    = nil
-	round.lowRoller     = nil
-	round.highTyers     = {}
-	round.lowTyers      = {}
-	round.acceptEntries = true
-	round.acceptRolls   = false
-
-	self:ChatMsg(format(".:Hi-Lo Casino:. RULES: %s .:. STAKES << %s >>", db.profile.rulesName, ConvertRollToGold(round.stakes)))
-	self:ChatMsg(format(".:HiLo:. To enter: type %s", db.profile.enterMsg))
-end
-
-function RC:AnnounceLastCall()
-	self:ChatMsg(format(".:HiLo:. Last Call to join! To withdraw, type %s", db.profile.withdrawMsg))
-end
-
-function RC:AnnounceRolling()
-	if round.entrantsCount > 1 then
-		round.acceptEntries = false
-		round.acceptRolls   = true
-		self:ChatMsg(format(".:HiLo - /roll %s NOW:.", round.stakes))
-	else
-		self:ChatMsg("Not enough Players!")
-	end
 end
 
 function RC:RoundWrapup()
 	-- Runs from the CHAT_MSG_SYSTEM roll event, so Say/channel lines are queued.
 	deferChat = true
-	self:ReportResults()
-	deferChat = false
+	local ok, err = pcall(self.ReportResults, self)
+	deferChat = nil
 	self:ResetRound()
-	if pendingMsgs then
-		self:Print("|cffffff00Round complete.|r Click |cff59f0dcAnnounce Results|r (or type /hilo next) to post the payouts.")
-	else
-		self:Print("|cffffff00Round complete and reset.|r")
-	end
+	if not ok then geterrorhandler()(err) end
+	self:Print(pendingMsgs
+		and "|cffffff00Round complete.|r Click |cff59f0dcAnnounce Results|r (or type /hilo next) to post the payouts."
+		or "|cffffff00Round complete and reset.|r")
 end
 
 function RC:NextPhase()
 	if self:FlushPending() then return end
-	if round.phase == 0 then
-		self:StartRound()
-	elseif round.phase == 1 then
-		self:AnnounceLastCall()
-	elseif round.phase == 2 then
-		self:AnnounceRolling()
-		if not round.acceptRolls then return end   -- not enough players, stay on this phase
+	local p = round.phase
+	if p == 0 then
+		round = NewRound(self:RollCap())
+		round.acceptEntries = true
+		personalEntered, personalRolled = false, false
+		self:ChatMsg(format(".:Hi-Lo Casino:. RULES: %s .:. STAKES << %s >>", db.profile.rulesName, ConvertRollToGold(round.stakes)))
+		self:ChatMsg(format(".:HiLo:. To enter: type %s", db.profile.enterMsg))
+	elseif p == 1 then
+		self:ChatMsg(format(".:HiLo:. Last Call to join! To withdraw, type %s", db.profile.withdrawMsg))
+	elseif p == 2 then
+		if round.entrantsCount < 2 then return self:ChatMsg("Not enough Players!") end
+		round.acceptEntries, round.acceptRolls = false, true
+		self:ChatMsg(format(".:HiLo - /roll %s NOW:.", round.stakes))
+	else
+		return   -- rolling: the round ends with the last roll
 	end
-	round.phase = round.phase + 1
+	round.phase = p + 1
+	self:UpdateActionList()
 	self:RefreshControls()
 end
 
 function RC:ListRemaining()
-	local rollers = ""
-	for _, info in pairs(round.entrants) do
-		if info.entered and not info.rolled then
-			rollers = info.name .. (rollers == "" and "" or ", ") .. rollers
-		end
+	local names = {}
+	for _, v in pairs(round.entrants) do
+		if v.entered and not v.rolled then names[#names + 1] = v.name end
 	end
-	local function nameOf(key) return key and round.entrants[key] and round.entrants[key].name or tostring(key) end
-	if rollers == "" then
-		self:ChatMsg("Everyone has rolled.")
-	else
-		self:ChatMsg(format("Remaining Rollers: %s  .:.  High: %s (%s)  Low: %s (%s)",
-			rollers, nameOf(round.highRoller), self:GetHighRoll(), nameOf(round.lowRoller), self:GetLowRoll()))
-	end
+	if #names == 0 then return self:ChatMsg("Everyone has rolled.") end
+	table.sort(names)
+	local function nameOf(key) return key and round.entrants[key].name or "nil" end
+	self:ChatMsg(format("Remaining Rollers: %s  .:.  High: %s (%s)  Low: %s (%s)", concat(names, ", "),
+		nameOf(round.highRoller), self:GetHighRoll(), nameOf(round.lowRoller), self:GetLowRoll()))
 end
-
---==========================================================================
---  USER ACTIONS (button callbacks)
---==========================================================================
 
 function RC:DoPersonalEnter()
 	self:ChatMsg(db.profile.enterMsg)
@@ -682,21 +523,17 @@ function RC:DoPersonalEnter()
 end
 
 function RC:DoPersonalRoll()
-	if RandomRoll then
-		RandomRoll(1, round.stakes)
-	else
-		hash_SlashCmdList[SLASH_RANDOM1:upper()](round.stakes)
-	end
+	RandomRoll(1, round.stakes)
 	personalRolled = true
 	self:RefreshControls()
 end
 
 --==========================================================================
---  UI  (NaowhForever house look: follows its live theme and fonts when it
---  is loaded, otherwise its "Midnight" palette)
+--  UI KIT  (NaowhForever house look; follows its live theme and fonts when
+--  it is loaded, otherwise its "Midnight" palette)
 --==========================================================================
 
-local FALLBACK_THEME = {   -- NaowhForever "Midnight" preset
+local FALLBACK_THEME = {
 	bg         = { r = 0x0b / 255, g = 0x10 / 255, b = 0x20 / 255 },
 	panel      = { r = 0x15 / 255, g = 0x1c / 255, b = 0x30 / 255 },
 	line       = { r = 0x2a / 255, g = 0x35 / 255, b = 0x50 / 255 },
@@ -708,15 +545,11 @@ local FALLBACK_THEME = {   -- NaowhForever "Midnight" preset
 local WIN_RGB     = { r = 0.30, g = 0.82, b = 0.48 }   -- Naowh "have" green
 local LOSE_RGB    = { r = 0.97, g = 0.44, b = 0.44 }   -- Naowh red
 local PENDING_RGB = { r = 0.98, g = 0.80, b = 0.08 }   -- Naowh "time low" amber
+local FALLBACK_MEDIA = { chevron = "Interface\\Buttons\\Arrow-Down-Up", cog = "Interface\\Buttons\\UI-OptionsButton" }
 
-local WIN_W, WIN_H = 520, 660
 local HEADER, PAD, FOOTER = 52, 12, 20
 local CARD_PAD, CARD_GAP, CARD_TITLE = 10, 8, 30
-local INNER = WIN_W - PAD * 2 - CARD_PAD * 2      -- usable width inside a card
-local ROW_H = 22
-local DISABLED_ALPHA = 0.4
-local BACKDROP_ALPHA = 0.97
-local CARD_FILL, CARD_EDGE = 0.035, 0.7
+local DISABLED_ALPHA, BACKDROP_ALPHA, CARD_FILL, CARD_EDGE = 0.4, 0.97, 0.035, 0.7
 local ICON = "Interface\\AddOns\\HiLoCasino\\media\\icon"
 
 local function Naowh()
@@ -725,8 +558,7 @@ local function Naowh()
 end
 
 local function Theme()
-	local N = Naowh()
-	local T = N and N.THEME
+	local T = Naowh() and _G.NaowhForever.THEME
 	if T and T.bg and T.fg and T.accent then return T end
 	return FALLBACK_THEME
 end
@@ -742,89 +574,82 @@ local function FontPath(heading)
 end
 
 local function Px(region)
-	return PixelUtil.GetPixelToUIUnitFactor() / math.max(region:GetEffectiveScale(), 0.01)
+	return PixelUtil.GetPixelToUIUnitFactor() / max(region:GetEffectiveScale(), 0.01)
 end
 
 local function Hex(c)
 	return format("|cff%02x%02x%02x", floor(c.r * 255 + 0.5), floor(c.g * 255 + 0.5), floor(c.b * 255 + 0.5))
 end
 
--- Static widgets register a painter; the window re-runs them all on show,
--- so a theme or font change in NaowhForever is picked up next time it opens.
+local function SetRGB(fs, c) fs:SetTextColor(c.r, c.g, c.b, 1) end
+
+-- Widgets register a painter; windows re-run them all on show, so a theme,
+-- font or scale change is picked up.
 local painters = {}
 local function Paint(fn)
 	painters[#painters + 1] = fn
 	fn(Theme())
 end
-local function RepaintAll()
+function RepaintAll()
 	local T = Theme()
 	for i = 1, #painters do painters[i](T) end
 end
 
 local function Border(frame, layer)
-	local edges = {}
-	for i = 1, 4 do edges[i] = frame:CreateTexture(nil, layer or "BORDER", nil, 7) end
-	edges[1]:SetPoint("TOPLEFT");    edges[1]:SetPoint("TOPRIGHT")
-	edges[2]:SetPoint("BOTTOMLEFT"); edges[2]:SetPoint("BOTTOMRIGHT")
-	edges[3]:SetPoint("TOPLEFT");    edges[3]:SetPoint("BOTTOMLEFT")
-	edges[4]:SetPoint("TOPRIGHT");   edges[4]:SetPoint("BOTTOMRIGHT")
+	local e = {}
+	for i = 1, 4 do e[i] = frame:CreateTexture(nil, layer or "BORDER", nil, 7) end
+	e[1]:SetPoint("TOPLEFT"); e[1]:SetPoint("TOPRIGHT")
+	e[2]:SetPoint("BOTTOMLEFT"); e[2]:SetPoint("BOTTOMRIGHT")
+	e[3]:SetPoint("TOPLEFT"); e[3]:SetPoint("BOTTOMLEFT")
+	e[4]:SetPoint("TOPRIGHT"); e[4]:SetPoint("BOTTOMRIGHT")
 	local border = {}
-	function border.SetColor(_, r, g, b, a)
-		for i = 1, 4 do edges[i]:SetColorTexture(r, g, b, a or 1) end
-	end
+	function border.SetColor(_, r, g, b, a) for i = 1, 4 do e[i]:SetColorTexture(r, g, b, a or 1) end end
 	function border.Fit()
 		local p = Px(frame)
-		edges[1]:SetHeight(p); edges[2]:SetHeight(p)
-		edges[3]:SetWidth(p);  edges[4]:SetWidth(p)
+		e[1]:SetHeight(p); e[2]:SetHeight(p); e[3]:SetWidth(p); e[4]:SetWidth(p)
 	end
 	border.Fit()
 	return border
 end
 
--- colorKey: a THEME key repainted with the theme, or nil for caller-set color.
+-- colorKey: a theme key repainted with the theme, or nil for caller-set color.
 local function Text(parent, size, colorKey, heading, justify)
 	local fs = parent:CreateFontString(nil, "OVERLAY")
-	if heading then
-		fs:SetShadowColor(0, 0, 0, 1)
-		fs:SetShadowOffset(1, -1)
-	end
+	if heading then fs:SetShadowColor(0, 0, 0, 1); fs:SetShadowOffset(1, -1) end
 	if justify then fs:SetJustifyH(justify) end
 	Paint(function(T)
 		fs:SetFont(FontPath(heading), size, "")
-		if colorKey then
-			local c = T[colorKey] or T.fg
-			fs:SetTextColor(c.r, c.g, c.b, 1)
-		end
+		if colorKey then SetRGB(fs, T[colorKey] or T.fg) end
 	end)
 	return fs
 end
 
 local function Click()
-	if SOUNDKIT and SOUNDKIT.U_CHAT_SCROLL_BUTTON then PlaySound(SOUNDKIT.U_CHAT_SCROLL_BUTTON) end
+	if db.profile.clickSound and SOUNDKIT and SOUNDKIT.U_CHAT_SCROLL_BUTTON then PlaySound(SOUNDKIT.U_CHAT_SCROLL_BUTTON) end
+end
+
+local function Icon(parent, name, size)
+	local tex, N = parent:CreateTexture(nil, "OVERLAY"), Naowh()
+	tex:SetSize(size, size)
+	if N and N.MEDIA then tex:SetTexture(N.MEDIA .. name, nil, nil, "TRILINEAR") else tex:SetTexture(FALLBACK_MEDIA[name]) end
+	Paint(function(T) tex:SetVertexColor(T.muted.r, T.muted.g, T.muted.b, 1) end)
+	return tex, N and N.MEDIA
 end
 
 local function ButtonRest(btn)
 	local T = Theme()
-	if btn.primary then
-		btn.bg:SetColorTexture(T.accent.r, T.accent.g, T.accent.b, 1)
-		btn.border:SetColor(T.accent.r, T.accent.g, T.accent.b, 1)
-		btn.label:SetTextColor(T.bg.r, T.bg.g, T.bg.b, 1)
-	else
-		btn.bg:SetColorTexture(T.panel.r, T.panel.g, T.panel.b, 0.9)
-		btn.border:SetColor(T.line.r, T.line.g, T.line.b, 1)
-		btn.label:SetTextColor(T.fg.r, T.fg.g, T.fg.b, 1)
-	end
+	local fill = btn.primary and T.accent or T.panel
+	btn.bg:SetColorTexture(fill.r, fill.g, fill.b, btn.primary and 1 or 0.9)
+	local edge = btn.primary and T.accent or T.line
+	btn.border:SetColor(edge.r, edge.g, edge.b, 1)
+	SetRGB(btn.label, btn.primary and T.bg or T.fg)
 end
 
 local function ButtonHover(btn)
 	if btn.disabled then return end
 	local T = Theme()
-	local soft = T.accentSoft or T.accent
-	if btn.primary then
-		btn.bg:SetColorTexture(soft.r, soft.g, soft.b, 1)
-	else
-		btn.bg:SetColorTexture(T.panel.r, T.panel.g, T.panel.b, 1)
-	end
+	local fill = btn.primary and (T.accentSoft or T.accent) or T.panel
+	btn.bg:SetColorTexture(fill.r, fill.g, fill.b, 1)
 	btn.border:SetColor(T.accent.r, T.accent.g, T.accent.b, 1)
 	if btn.tip then
 		GameTooltip:SetOwner(btn, "ANCHOR_TOP")
@@ -850,7 +675,6 @@ local function Button(parent, text, w, h, onClick, primary, tip)
 		Click()
 		if onClick then onClick(self) end
 	end)
-	-- AceGUI-compatible calls used by RefreshControls.
 	btn.SetText = function(self, t) self.label:SetText(t) end
 	btn.SetDisabled = function(self, disabled)
 		self.disabled = disabled and true or false
@@ -861,7 +685,19 @@ local function Button(parent, text, w, h, onClick, primary, tip)
 	return btn
 end
 
-local function Field(parent, w, h, onCommit)
+-- Buttons side by side across width w; specs = { { text, onClick, primary, tip }, ... }.
+local function ButtonRow(parent, x, y, w, h, specs)
+	local n, out = #specs, {}
+	local bw = floor((w - 8 * (n - 1)) / n)
+	for i, s in ipairs(specs) do
+		out[i] = Button(parent, s[1], i == n and w - (bw + 8) * (n - 1) or bw, h, s[2], s[3], s[4])
+		if i == 1 then out[i]:SetPoint("TOPLEFT", x, y) else out[i]:SetPoint("LEFT", out[i - 1], "RIGHT", 8, 0) end
+	end
+	return unpack(out)
+end
+
+-- An edit box that commits on Enter or focus loss; get() feeds :Refresh().
+local function Field(parent, w, h, onCommit, get)
 	local box = CreateFrame("EditBox", nil, parent)
 	box:SetSize(w, h)
 	box:SetAutoFocus(false)
@@ -870,28 +706,29 @@ local function Field(parent, w, h, onCommit)
 	box.bg:SetAllPoints()
 	box.border = Border(box)
 	local function Rest(self)
-		local T = Theme()
-		local c = self:HasFocus() and T.accent or T.line
+		local c = self:HasFocus() and Theme().accent or Theme().line
 		self.border:SetColor(c.r, c.g, c.b, 1)
 	end
-	local function Commit(self)
-		if self.committing then return end
-		self.committing = true
-		onCommit(self, self:GetText())
-		self.committing = false
-	end
-	box:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
-	box:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
+	box:SetScript("OnEscapePressed", box.ClearFocus)
+	box:SetScript("OnEnterPressed", box.ClearFocus)
 	box:SetScript("OnEditFocusGained", Rest)
-	box:SetScript("OnEditFocusLost", function(self) Commit(self); Rest(self) end)
+	box:SetScript("OnEditFocusLost", function(self)
+		if not self.committing then
+			self.committing = true
+			onCommit(self, self:GetText())
+			self.committing = nil
+		end
+		Rest(self)
+	end)
 	box.SetDisabled = function(self, disabled)
 		self:SetEnabled(not disabled)
 		self:SetAlpha(disabled and DISABLED_ALPHA or 1)
 		if disabled then self:ClearFocus() end
 	end
+	box.Refresh = function(self) if get and not self:HasFocus() then self:SetText(tostring(get())) end end
 	Paint(function(T)
 		box:SetFont(FontPath(false), 12, "")
-		box:SetTextColor(T.fg.r, T.fg.g, T.fg.b, 1)
+		SetRGB(box, T.fg)
 		box.bg:SetColorTexture(T.bg.r, T.bg.g, T.bg.b, 0.9)
 		Rest(box)
 		box.border.Fit()
@@ -907,34 +744,16 @@ local function Dropdown(parent, w, h, options, getValue, setValue)
 	dd.label:SetPoint("RIGHT", -24, 0)
 	dd.label:SetJustifyH("LEFT")
 	dd.label:SetWordWrap(false)
-
-	local N = Naowh()
-	local arrow = dd:CreateTexture(nil, "OVERLAY")
-	arrow:SetSize(12, 12)
+	local arrow, naowh = Icon(dd, "chevron", 12)
 	arrow:SetPoint("RIGHT", -8, 0)
-	if N and N.MEDIA then
-		arrow:SetTexture(N.MEDIA .. "chevron", nil, nil, "TRILINEAR")
-		arrow:SetRotation(-math.pi / 2)
-	else
-		arrow:SetTexture("Interface\\Buttons\\Arrow-Down-Up")
-	end
-	Paint(function(T) arrow:SetVertexColor(T.muted.r, T.muted.g, T.muted.b, 1) end)
-
-	function dd:Refresh()
-		local v = getValue()
-		for _, o in ipairs(options) do
-			if o[1] == v then self.label:SetText(o[2]); return end
-		end
-		self.label:SetText(tostring(v))
-	end
+	if naowh then arrow:SetRotation(-math.pi / 2) end
+	function dd:Refresh() self.label:SetText(Label(options, getValue())) end
 	dd:SetScript("OnClick", function(self)
 		if self.disabled then return end
 		Click()
 		MenuUtil.CreateContextMenu(self, function(_, root)
 			for _, o in ipairs(options) do
-				root:CreateRadio(o[2],
-					function() return getValue() == o[1] end,
-					function() setValue(o[1]); dd:Refresh() end)
+				root:CreateRadio(o[2], function() return getValue() == o[1] end, function() setValue(o[1]); dd:Refresh() end)
 			end
 		end)
 	end)
@@ -942,410 +761,369 @@ local function Dropdown(parent, w, h, options, getValue, setValue)
 	return dd
 end
 
-local function Card(parent, title)
+-- A themed checkbox with a label.
+local function Toggle(parent, text, get, set)
+	local btn = CreateFrame("Button", nil, parent)
+	btn:SetSize(250, 22)
+	local box = CreateFrame("Frame", nil, btn)
+	box:SetSize(16, 16)
+	box:SetPoint("LEFT")
+	local bg, border = box:CreateTexture(nil, "BACKGROUND"), Border(box)
+	bg:SetAllPoints()
+	local check = box:CreateTexture(nil, "ARTWORK")
+	check:SetPoint("TOPLEFT", 4, -4)
+	check:SetPoint("BOTTOMRIGHT", -4, 4)
+	local label = Text(btn, 12, "fg", false, "LEFT")
+	label:SetPoint("LEFT", box, "RIGHT", 8, 0)
+	label:SetText(text)
+	function btn:Refresh()
+		local T, on = Theme(), get() and true or false
+		bg:SetColorTexture(T.bg.r, T.bg.g, T.bg.b, 0.9)
+		local edge = on and T.accent or T.line
+		border:SetColor(edge.r, edge.g, edge.b, 1)
+		border.Fit()
+		check:SetColorTexture(T.accent.r, T.accent.g, T.accent.b, 1)
+		check:SetShown(on)
+	end
+	btn:SetScript("OnClick", function(self) Click(); set(not get()); self:Refresh() end)
+	Paint(function() btn:Refresh() end)
+	return btn
+end
+
+-- below: a card to sit under, or a y offset from the top. Every card gets a
+-- right-aligned muted note in its title row.
+local function Card(parent, title, below, height)
 	local card = CreateFrame("Frame", nil, parent)
-	card.fill = card:CreateTexture(nil, "BACKGROUND")
-	card.fill:SetAllPoints()
-	card.border = Border(card)
-	card.title = Text(card, 12, "accent", true, "LEFT")
-	card.title:SetPoint("TOPLEFT", CARD_PAD, -10)
-	card.title:SetText(title)
+	if type(below) == "table" then
+		card:SetPoint("TOPLEFT", below, "BOTTOMLEFT", 0, -CARD_GAP)
+		card:SetPoint("RIGHT", parent, "RIGHT", -PAD, 0)
+	elseif below then
+		card:SetPoint("TOPLEFT", PAD, below)
+		card:SetPoint("RIGHT", parent, "RIGHT", -PAD, 0)
+	end
+	if height then card:SetHeight(height) end
+	local fill, border = card:CreateTexture(nil, "BACKGROUND"), Border(card)
+	fill:SetAllPoints()
+	local head = Text(card, 12, "accent", true, "LEFT")
+	head:SetPoint("TOPLEFT", CARD_PAD, -10)
+	head:SetText(title)
+	card.note = Text(card, 11, "muted", false, "RIGHT")
+	card.note:SetPoint("TOPRIGHT", -CARD_PAD, -11)
 	Paint(function(T)
-		card.fill:SetColorTexture(T.fg.r, T.fg.g, T.fg.b, CARD_FILL)
-		card.border:SetColor(0, 0, 0, CARD_EDGE)
-		card.border.Fit()
+		fill:SetColorTexture(T.fg.r, T.fg.g, T.fg.b, CARD_FILL)
+		border:SetColor(0, 0, 0, CARD_EDGE)
+		border.Fit()
 	end)
 	return card
 end
 
-local function FieldLabel(parent, text, x, y)
-	local fs = Text(parent, 11, "muted", false, "LEFT")
+local function FieldLabel(parent, text, x, y, size, color)
+	local fs = Text(parent, size or 11, color or "muted", false, "LEFT")
 	fs:SetPoint("TOPLEFT", x, y)
 	fs:SetText(text)
 	return fs
 end
 
-------------------------------------------------------------------------
---  Controls state
-------------------------------------------------------------------------
-
-function RC:RefreshControls()
-	local ui = self.ui
-	if not ui or not ui.frame then return end
-	local p = round.phase
-	local T = Theme()
-
-	if pendingMsgs then
-		ui.phaseBtn:SetText("Announce Results")
-		ui.phaseBtn:SetDisabled(false)
-	else
-		ui.phaseBtn:SetText(PHASE_LABELS[p] or PHASE_LABELS[0])
-		ui.phaseBtn:SetDisabled(p >= 3)
-	end
-
-	ui.listBtn:SetDisabled(not (p >= 3 and self:GetRemainingToRollCount() > 0))
-	ui.resetBtn:SetDisabled(p == 0)
-	ui.enterBtn:SetDisabled(personalEntered or not round.acceptEntries)
-	ui.rollBtn:SetDisabled(personalRolled or not round.acceptRolls)
-
-	ui.stakesEdit:SetDisabled(p ~= 0)
-	ui.ratioDrop:SetDisabled(p ~= 0)
-	if p == 0 and not ui.stakesEdit:HasFocus() then ui.stakesEdit:SetText(tostring(db.profile.stakesGold)) end
-	ui.ratioDrop:Refresh()
-	ui.channelDrop:Refresh()
-
-	local cap = round.stakes
-	ui.rollFor:SetText(format("Rolling for %s%s|r   %s·|r   players %s/roll 1-%d|r",
-		Hex(T.accent), ConvertRollToGold(cap), Hex(T.muted), Hex(T.fg), cap))
-	ui.ratioNote:SetText(RATIO_OPTIONS[CurrentRatio()] or (CurrentRatio() .. " : 1"))
-
-	local phaseName = ({ [0] = "Idle", [1] = "Entry open", [2] = "Last call", [3] = "Rolling" })[p] or "Idle"
-	ui.subtitle:SetText(format("%s   ·   %d entrants   ·   %d yet to roll",
-		phaseName, round.entrantsCount or 0, self:GetRemainingToRollCount()))
-	ui.potNote:SetText(format("Pot %s  ·  1-%d", ConvertRollToGold(cap), cap))
-
-	ui.topBtn:SetText("Post Top " .. db.profile.topN)
-	ui.bottomBtn:SetText("Post Bottom " .. db.profile.topN)
-	ui.statsPeriod:SetText(self:PeriodName(db.profile.histPeriod))
+-- A mouse-wheel scroll area inside a card; returns the scroll child and an
+-- empty-state text.
+local function ScrollList(card, top, width, step)
+	local scroll = CreateFrame("ScrollFrame", nil, card)
+	scroll:SetPoint("TOPLEFT", CARD_PAD, top)
+	scroll:SetPoint("BOTTOMRIGHT", -CARD_PAD, CARD_PAD)
+	local child = CreateFrame("Frame", nil, scroll)
+	child:SetSize(width, 1)
+	scroll:SetScrollChild(child)
+	scroll:EnableMouseWheel(true)
+	scroll:SetScript("OnMouseWheel", function(self, delta)
+		self:SetVerticalScroll(min(max(0, child:GetHeight() - self:GetHeight()), max(0, self:GetVerticalScroll() - delta * step)))
+	end)
+	local empty = Text(card, 12, "muted", false, "CENTER")
+	empty:SetPoint("CENTER", scroll, "CENTER")
+	return child, empty
 end
 
-------------------------------------------------------------------------
---  The Action (entrant list, pooled rows)
-------------------------------------------------------------------------
-
-local function ActionRow(ui, i)
-	local row = ui.rows[i]
-	if row then return row end
-	row = CreateFrame("Frame", nil, ui.listChild)
-	row:SetHeight(ROW_H)
-	row:SetPoint("TOPLEFT", 0, -(i - 1) * ROW_H)
-	row:SetPoint("RIGHT", ui.listChild, "RIGHT")
-	row.stripe = row:CreateTexture(nil, "BACKGROUND")
-	row.stripe:SetAllPoints()
-	row.idx = Text(row, 11, "muted", false, "RIGHT")
-	row.idx:SetPoint("LEFT", 0, 0)
-	row.idx:SetWidth(22)
-	row.name = Text(row, 12, nil, false, "LEFT")
-	row.name:SetPoint("LEFT", row.idx, "RIGHT", 10, 0)
-	row.roll = Text(row, 12, nil, true, "RIGHT")
-	row.roll:SetPoint("RIGHT", -10, 0)
-	row.mark = row:CreateTexture(nil, "ARTWORK")
-	row.mark:SetSize(2, ROW_H - 8)
-	row.mark:SetPoint("LEFT", row.idx, "RIGHT", 4, 0)
-	ui.rows[i] = row
+-- Pooled, striped list rows; build(row) adds the row's own parts once.
+local function PoolRow(pool, child, i, h, build)
+	local row = pool[i]
+	if not row then
+		row = CreateFrame("Frame", nil, child)
+		row:SetHeight(h)
+		row:SetPoint("TOPLEFT", 0, -(i - 1) * h)
+		row:SetPoint("RIGHT", child, "RIGHT")
+		row.stripe = row:CreateTexture(nil, "BACKGROUND")
+		row.stripe:SetAllPoints()
+		build(row)
+		pool[i] = row
+	end
+	local fg = Theme().fg
+	row.stripe:SetColorTexture(fg.r, fg.g, fg.b, i % 2 == 0 and 0.025 or 0)
+	row:Show()
 	return row
 end
 
-function RC:UpdateActionList()
-	local ui = self.ui
-	if not ui or not ui.listChild then return end
-	local T = Theme()
-
-	-- Stable order: by roll (high first) once rolled, then by name.
-	local list = {}
-	for _, v in pairs(round.entrants) do list[#list + 1] = v end
-	table.sort(list, function(a, b)
-		local ra, rb = tonumber(a.roll) or -1, tonumber(b.roll) or -1
-		if ra ~= rb then return ra > rb end
-		return a.name < b.name
-	end)
-
-	for i, v in ipairs(list) do
-		local row = ActionRow(ui, i)
-		row:Show()
-		row.stripe:SetColorTexture(T.fg.r, T.fg.g, T.fg.b, (i % 2 == 0) and 0.025 or 0)
-		row.idx:SetText(i .. ".")
-		row.name:SetText(v.name)
-
-		local c, rollText, mark = T.fg, tostring(v.roll), nil
-		if not v.entered then
-			c, rollText = T.muted, "withdrawn"
-		elseif (tonumber(v.roll) or 0) <= 0 then
-			c, rollText = PENDING_RGB, "—"
-		elseif has_value(round.highTyers, v.key) then
-			c, mark = WIN_RGB, WIN_RGB
-		elseif has_value(round.lowTyers, v.key) then
-			c, mark = LOSE_RGB, LOSE_RGB
-		end
-		row.name:SetTextColor(v.entered and T.fg.r or T.muted.r, v.entered and T.fg.g or T.muted.g, v.entered and T.fg.b or T.muted.b, 1)
-		row.roll:SetText(rollText)
-		row.roll:SetTextColor(c.r, c.g, c.b, 1)
-		if mark then
-			row.mark:SetColorTexture(mark.r, mark.g, mark.b, 1)
-			row.mark:Show()
-		else
-			row.mark:Hide()
-		end
-	end
-	for i = #list + 1, #ui.rows do ui.rows[i]:Hide() end
-
-	ui.listChild:SetHeight(math.max(1, #list * ROW_H))
-	ui.empty:SetShown(#list == 0)
-	if #list == 0 then
-		ui.empty:SetText(format("No entrants yet.\nStart a round and have players type  %s%s|r",
-			Hex(T.accent), db.profile.enterMsg))
-	end
-	ui.actionCount:SetText(#list > 0 and format("%d %s", #list, #list == 1 and "player" or "players") or "")
+local function HidePool(pool, from)
+	for i = from, #pool do pool[i]:Hide() end
 end
 
-------------------------------------------------------------------------
---  Game card (custom channel row only when "Custom Channel" is picked)
-------------------------------------------------------------------------
-
-function RC:RebuildGameGroup()
-	local ui = self.ui
-	if not ui or not ui.gameCard then return end
-	local showChannel = db.profile.chatMethod == "CHANNEL"
-	ui.channelLabel:SetShown(showChannel)
-	ui.channelEdit:SetShown(showChannel)
-	if showChannel then ui.channelEdit:SetText(db.profile.customChannel) end
-
-	local y = showChannel and -134 or -86
-	ui.rollFor:ClearAllPoints()
-	ui.rollFor:SetPoint("TOPLEFT", CARD_PAD, y)
-	ui.ratioNote:ClearAllPoints()
-	ui.ratioNote:SetPoint("TOPRIGHT", -CARD_PAD, y)
-	ui.rulesBtn:ClearAllPoints()
-	ui.rulesBtn:SetPoint("TOPLEFT", CARD_PAD, y - 24)
-	ui.gameCard:SetHeight(-(y - 24) + 24 + CARD_PAD)
-	self:RefreshControls()
+local function RankText(row)
+	row.rank = Text(row, 11, "muted", false, "RIGHT")
+	row.rank:SetPoint("LEFT")
+	row.rank:SetWidth(22)
 end
 
-------------------------------------------------------------------------
---  Window
-------------------------------------------------------------------------
-
-local function SavePosition(frame)
-	local point, _, relPoint, x, y = frame:GetPoint()
-	db.profile.window = { point, relPoint, x, y }
-end
-
-function RC:BuildWindow()
-	if self.ui and self.ui.frame then return end
-	local ui = { rows = {} }
-	self.ui = ui
-
-	local f = CreateFrame("Frame", "HiLoCasinoWindow", UIParent)
+-- A movable, Esc-closable window: backdrop, header with logo, title,
+-- subtitle, settings and close buttons, and two footer texts.
+local function Window(name, w, h, posKey, word1, word2, place)
+	local f = CreateFrame("Frame", name, UIParent)
 	f:Hide()
-	f:SetSize(WIN_W, WIN_H)
+	f:SetSize(w, h)
 	f:SetFrameStrata("HIGH")
 	f:SetToplevel(true)
 	f:SetClampedToScreen(true)
 	f:SetMovable(true)
 	f:EnableMouse(true)
 	f:RegisterForDrag("LeftButton")
-	f:SetScript("OnDragStart", f.StartMoving)
-	f:SetScript("OnDragStop", function(self) self:StopMovingOrSizing(); SavePosition(self) end)
-	local pos = db.profile.window
-	if type(pos) == "table" and pos[1] then
-		f:SetPoint(pos[1], UIParent, pos[2], pos[3], pos[4])
-	else
-		f:SetPoint("CENTER")
+	f:SetScript("OnDragStart", function(self) if not db.profile.lockWindows then self:StartMoving() end end)
+	f:SetScript("OnDragStop", function(self)
+		self:StopMovingOrSizing()
+		local point, _, relPoint, x, y = self:GetPoint()
+		db.profile[posKey] = { point, relPoint, x, y }
+	end)
+	function f:Place()
+		self:ClearAllPoints()
+		local pos = db.profile[posKey]
+		if type(pos) == "table" and pos[1] then self:SetPoint(pos[1], UIParent, pos[2], pos[3], pos[4]) else place(self) end
 	end
-	tinsert(UISpecialFrames, "HiLoCasinoWindow")   -- Esc closes it
-	ui.frame = f
+	f:Place()
+	tinsert(UISpecialFrames, name)
 
-	-- Backdrop, outer border, header rule.
-	local bg = f:CreateTexture(nil, "BACKGROUND", nil, -8)
+	local bg, tint, rule = f:CreateTexture(nil, "BACKGROUND", nil, -8), f:CreateTexture(nil, "BACKGROUND", nil, -7), f:CreateTexture(nil, "ARTWORK")
 	bg:SetAllPoints()
-	local outer = Border(f, "OVERLAY")
-	local rule = f:CreateTexture(nil, "ARTWORK")
+	tint:SetPoint("TOPLEFT")
+	tint:SetPoint("BOTTOMRIGHT", f, "TOPRIGHT", 0, -HEADER)
 	rule:SetPoint("TOPLEFT", 0, -HEADER)
 	rule:SetPoint("TOPRIGHT", 0, -HEADER)
-	local headTint = f:CreateTexture(nil, "BACKGROUND", nil, -7)
-	headTint:SetPoint("TOPLEFT")
-	headTint:SetPoint("BOTTOMRIGHT", f, "TOPRIGHT", 0, -HEADER)
+	local outer = Border(f, "OVERLAY")
+	local title = Text(f, 20, "fg", true, "LEFT")
 	Paint(function(T)
+		f:SetScale(db.profile.scale or 1)
 		bg:SetColorTexture(T.bg.r, T.bg.g, T.bg.b, BACKDROP_ALPHA)
-		headTint:SetColorTexture(T.panel.r, T.panel.g, T.panel.b, 0.6)
+		tint:SetColorTexture(T.panel.r, T.panel.g, T.panel.b, 0.6)
 		outer:SetColor(0, 0, 0, 1)
 		outer.Fit()
 		rule:SetColorTexture(0, 0, 0, 1)
 		rule:SetHeight(Px(f))
+		title:SetText(word1 .. " " .. Hex(T.accent) .. word2 .. "|r")
 	end)
 
-	-- Header: logo, title, live status line, close.
 	local logo = f:CreateTexture(nil, "ARTWORK")
 	logo:SetSize(32, 32)
 	logo:SetPoint("LEFT", f, "TOPLEFT", PAD, -HEADER / 2)
 	logo:SetTexture(ICON)
-	local title = Text(f, 20, "fg", true, "LEFT")
 	title:SetPoint("TOPLEFT", logo, "TOPRIGHT", 10, 1)
-	Paint(function(T) title:SetText("Hi-Lo " .. Hex(T.accent) .. "Casino|r") end)
-	ui.subtitle = Text(f, 11, "muted", false, "LEFT")
-	ui.subtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -2)
 	local close = Button(f, "x", 24, 24, function() f:Hide() end)
 	close:SetPoint("RIGHT", f, "TOPRIGHT", -8, -HEADER / 2)
+	local cog = Button(f, "", 24, 24, function() RC:OpenOptions() end, false, "Settings")
+	cog:SetPoint("RIGHT", close, "LEFT", -6, 0)
+	Icon(cog, "cog", 14):SetPoint("CENTER")
+	f.subtitle = Text(f, 11, "muted", false, "LEFT")
+	f.subtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -2)
+	f.subtitle:SetPoint("RIGHT", cog, "LEFT", -10, 0)
+	f.subtitle:SetWordWrap(false)
+	f.footLeft = Text(f, 10, "muted", false, "LEFT")
+	f.footLeft:SetPoint("BOTTOMLEFT", PAD + 2, 6)
+	f.footRight = Text(f, 10, "muted", false, "RIGHT")
+	f.footRight:SetPoint("BOTTOMRIGHT", -PAD - 2, 6)
+	return f
+end
 
-	-- Footer: brand and pot.
-	local brand = Text(f, 10, "muted", false, "LEFT")
-	brand:SetPoint("BOTTOMLEFT", PAD + 2, 6)
-	local version = (C_AddOns and C_AddOns.GetAddOnMetadata or GetAddOnMetadata)(ADDON, "Version") or ""
-	Paint(function(T) brand:SetText(Hex(T.fg) .. "Hi-Lo|r " .. Hex(T.accent) .. "Casino|r  " .. version) end)
-	ui.potNote = Text(f, 10, "muted", false, "RIGHT")
-	ui.potNote:SetPoint("BOTTOMRIGHT", -PAD - 2, 6)
+local function Get(key) return function() return db.profile[key] end end
+local function Put(key) return function(v) RC:Set(key, v) end end
 
-	-- ===== Game card =====
-	local game = Card(f, "Game")
-	game:SetPoint("TOPLEFT", PAD, -HEADER - PAD)
-	game:SetPoint("RIGHT", f, "RIGHT", -PAD, 0)
-	ui.gameCard = game
+--==========================================================================
+--  MAIN WINDOW
+--==========================================================================
 
-	local colW = floor((INNER - 2 * 10) / 3)
-	FieldLabel(game, "Stakes (gold)", CARD_PAD, -CARD_TITLE)
-	FieldLabel(game, "Ratio  (roll : gold)", CARD_PAD + colW + 10, -CARD_TITLE)
-	FieldLabel(game, "Broadcast to", CARD_PAD + 2 * (colW + 10), -CARD_TITLE)
+local WIN_W, WIN_H, ROW_H = 520, 660, 22
+local INNER = WIN_W - PAD * 2 - CARD_PAD * 2      -- usable width inside a card
 
-	ui.stakesEdit = Field(game, colW, 26, function(box, text)
-		local v = tonumber(text)
-		if v and v > 0 then
-			db.profile.stakesGold = floor(v)
-			if round.phase == 0 then round.stakes = RC:RollCap() end
-		end
-		box:SetText(tostring(db.profile.stakesGold))
-		RC:RefreshControls()
+function RC:RefreshControls()
+	local ui = self.ui
+	if not ui or not ui.frame:IsShown() then return end
+	local p, T, cap = round.phase, Theme(), round.stakes
+
+	ui.phaseBtn:SetText(pendingMsgs and "Announce Results" or PHASE_BUTTON[p] or PHASE_BUTTON[0])
+	ui.phaseBtn:SetDisabled(not pendingMsgs and p >= 3)
+	ui.listBtn:SetDisabled(not (p >= 3 and self:GetRemainingToRollCount() > 0))
+	ui.resetBtn:SetDisabled(p == 0)
+	ui.enterBtn:SetDisabled(personalEntered or not round.acceptEntries)
+	ui.rollBtn:SetDisabled(personalRolled or not round.acceptRolls)
+	ui.stakesEdit:SetDisabled(p ~= 0)
+	ui.ratioDrop:SetDisabled(p ~= 0)
+	if p == 0 then ui.stakesEdit:Refresh() end
+	ui.ratioDrop:Refresh()
+	ui.channelDrop:Refresh()
+
+	ui.rollFor:SetText(format("Rolling for %s%s|r   %s·|r   players %s/roll 1-%d|r",
+		Hex(T.accent), ConvertRollToGold(cap), Hex(T.muted), Hex(T.fg), cap))
+	ui.ratioNote:SetText(Label(RATIOS, CurrentRatio()))
+	ui.subtitle:SetText(format("%s   ·   %d entrants   ·   %d yet to roll",
+		PHASE_NAME[p] or PHASE_NAME[0], round.entrantsCount, self:GetRemainingToRollCount()))
+	ui.potNote:SetText(format("Pot %s  ·  1-%d", ConvertRollToGold(cap), cap))
+	ui.topBtn:SetText("Post Top " .. db.profile.topN)
+	ui.bottomBtn:SetText("Post Bottom " .. db.profile.topN)
+	ui.statsPeriod:SetText(self:PeriodName(db.profile.histPeriod))
+end
+
+local function BuildActionRow(row)
+	RankText(row)
+	row.name = Text(row, 12, nil, false, "LEFT")
+	row.name:SetPoint("LEFT", row.rank, "RIGHT", 10, 0)
+	row.roll = Text(row, 12, nil, true, "RIGHT")
+	row.roll:SetPoint("RIGHT", -10, 0)
+	row.mark = row:CreateTexture(nil, "ARTWORK")
+	row.mark:SetSize(2, ROW_H - 8)
+	row.mark:SetPoint("LEFT", row.rank, "RIGHT", 4, 0)
+end
+
+function RC:UpdateActionList()
+	local ui = self.ui
+	if not ui or not ui.frame:IsShown() then return end
+	local T, list = Theme(), {}
+	for _, v in pairs(round.entrants) do list[#list + 1] = v end
+	table.sort(list, function(a, b)   -- highest roll first, then by name
+		if a.roll ~= b.roll then return a.roll > b.roll end
+		return a.name < b.name
 	end)
+
+	for i, v in ipairs(list) do
+		local row = PoolRow(ui.rows, ui.listChild, i, ROW_H, BuildActionRow)
+		local c, text, mark = T.fg, tostring(v.roll), nil
+		if not v.entered then
+			c, text = T.muted, "withdrawn"
+		elseif v.roll <= 0 then
+			c, text = PENDING_RGB, "—"
+		elseif Contains(round.highTyers, v.key) then
+			c, mark = WIN_RGB, WIN_RGB
+		elseif Contains(round.lowTyers, v.key) then
+			c, mark = LOSE_RGB, LOSE_RGB
+		end
+		row.rank:SetText(i .. ".")
+		row.name:SetText(v.name)
+		SetRGB(row.name, v.entered and T.fg or T.muted)
+		row.roll:SetText(text)
+		SetRGB(row.roll, c)
+		row.mark:SetShown(mark ~= nil)
+		if mark then row.mark:SetColorTexture(mark.r, mark.g, mark.b, 1) end
+	end
+	HidePool(ui.rows, #list + 1)
+	ui.listChild:SetHeight(max(1, #list * ROW_H))
+	ui.empty:SetShown(#list == 0)
+	ui.empty:SetText(format("No entrants yet.\nStart a round and have players type  %s%s|r", Hex(T.accent), db.profile.enterMsg))
+	ui.actionCount:SetText(#list > 0 and format("%d %s", #list, Plural(#list, "player", "players")) or "")
+end
+
+-- The custom channel row only shows when "Custom Channel" is picked.
+function RC:RebuildGameGroup()
+	local ui = self.ui
+	if not ui then return end
+	local showChannel = db.profile.chatMethod == "CHANNEL"
+	ui.channelLabel:SetShown(showChannel)
+	ui.channelEdit:SetShown(showChannel)
+	ui.channelEdit:Refresh()
+	local y = showChannel and -134 or -86
+	ui.rollFor:SetPoint("TOPLEFT", CARD_PAD, y)
+	ui.ratioNote:SetPoint("TOPRIGHT", -CARD_PAD, y)
+	ui.rulesBtn:SetPoint("TOPLEFT", CARD_PAD, y - 24)
+	ui.gameCard:SetHeight(-y + 24 + 24 + CARD_PAD)
+	self:RefreshControls()
+end
+
+function RC:BuildWindow()
+	if self.ui then return end
+	local ui = { rows = {} }
+	self.ui = ui
+	local f = Window("HiLoCasinoWindow", WIN_W, WIN_H, "window", "Hi-Lo", "Casino", function(w) w:SetPoint("CENTER") end)
+	ui.frame, ui.subtitle, ui.potNote = f, f.subtitle, f.footRight
+	Paint(function(T) f.footLeft:SetText(Hex(T.fg) .. "Hi-Lo|r " .. Hex(T.accent) .. "Casino|r  " .. Version()) end)
+
+	-- Game
+	local game = Card(f, "Game", -HEADER - PAD)
+	ui.gameCard = game
+	local colW = floor((INNER - 20) / 3)
+	local x2, x3 = CARD_PAD + colW + 10, CARD_PAD + 2 * (colW + 10)
+	FieldLabel(game, "Stakes (gold)", CARD_PAD, -CARD_TITLE)
+	FieldLabel(game, "Ratio  (roll : gold)", x2, -CARD_TITLE)
+	FieldLabel(game, "Broadcast to", x3, -CARD_TITLE)
+	ui.stakesEdit = Field(game, colW, 26, function(box, text) RC:Set("stakesGold", text); box:Refresh() end, Get("stakesGold"))
 	ui.stakesEdit:SetPoint("TOPLEFT", CARD_PAD, -CARD_TITLE - 16)
 	ui.stakesEdit:SetNumeric(true)
-
-	local ratioOptions = {}
-	for _, k in ipairs(RATIO_ORDER) do ratioOptions[#ratioOptions + 1] = { k, RATIO_OPTIONS[k] } end
-	ui.ratioDrop = Dropdown(game, colW, 26, ratioOptions,
-		function() return db.profile.ratio end,
-		function(v)
-			db.profile.ratio = v
-			if round.phase == 0 then round.stakes = RC:RollCap() end
-			RC:RefreshControls()
-		end)
-	ui.ratioDrop:SetPoint("TOPLEFT", CARD_PAD + colW + 10, -CARD_TITLE - 16)
-
-	local chanOptions = {}
-	for _, k in ipairs(CHAT_METHODS) do chanOptions[#chanOptions + 1] = { k, CHAT_LABELS[k] } end
-	ui.channelDrop = Dropdown(game, INNER - 2 * (colW + 10), 26, chanOptions,
-		function() return db.profile.chatMethod end,
-		function(v)
-			db.profile.chatMethod = v
-			RC:RebuildGameGroup()
-		end)
-	ui.channelDrop:SetPoint("TOPLEFT", CARD_PAD + 2 * (colW + 10), -CARD_TITLE - 16)
-
+	ui.ratioDrop = Dropdown(game, colW, 26, RATIOS, Get("ratio"), Put("ratio"))
+	ui.ratioDrop:SetPoint("TOPLEFT", x2, -CARD_TITLE - 16)
+	ui.channelDrop = Dropdown(game, INNER - 2 * (colW + 10), 26, CHATS, Get("chatMethod"), Put("chatMethod"))
+	ui.channelDrop:SetPoint("TOPLEFT", x3, -CARD_TITLE - 16)
 	ui.channelLabel = FieldLabel(game, "Custom channel name", CARD_PAD, -84)
-	ui.channelEdit = Field(game, INNER, 26, function(box, text)
-		text = text and text:gsub("^%s+", ""):gsub("%s+$", "") or ""
-		if text ~= "" then db.profile.customChannel = text end
-		box:SetText(db.profile.customChannel)
-	end)
+	ui.channelEdit = Field(game, INNER, 26, function(box, text) RC:Set("customChannel", text); box:Refresh() end, Get("customChannel"))
 	ui.channelEdit:SetPoint("TOPLEFT", CARD_PAD, -100)
-
 	ui.rollFor = Text(game, 13, "fg", false, "LEFT")
 	ui.ratioNote = Text(game, 11, "muted", false, "RIGHT")
 	ui.rulesBtn = Button(game, "Broadcast Rules", INNER, 24, function() RC:PrintRules() end, false,
 		"Post the Hi/Lo rules to the broadcast channel.")
 
-	-- ===== Round card =====
-	local rc = Card(f, "Round")
-	rc:SetPoint("TOPLEFT", game, "BOTTOMLEFT", 0, -CARD_GAP)
-	rc:SetPoint("RIGHT", f, "RIGHT", -PAD, 0)
-	rc:SetHeight(CARD_TITLE + 32 + 6 + 24 + 6 + 24 + CARD_PAD)
-
-	local half = floor((INNER - 8) / 2)
-	ui.phaseBtn = Button(rc, PHASE_LABELS[0], INNER, 32, function() RC:NextPhase() end, true)
+	-- Round
+	local rc = Card(f, "Round", game, CARD_TITLE + 32 + 6 + 24 + 6 + 24 + CARD_PAD)
+	ui.phaseBtn = Button(rc, PHASE_BUTTON[0], INNER, 32, function() RC:NextPhase() end, true)
 	ui.phaseBtn:SetPoint("TOPLEFT", CARD_PAD, -CARD_TITLE)
-	ui.listBtn = Button(rc, "List Remaining", half, 24, function() RC:ListRemaining() end, false,
-		"Post who still has to roll, plus the current high and low.")
-	ui.listBtn:SetPoint("TOPLEFT", ui.phaseBtn, "BOTTOMLEFT", 0, -6)
-	ui.resetBtn = Button(rc, "Reset Round", INNER - half - 8, 24, function() RC:ResetRound() end)
-	ui.resetBtn:SetPoint("LEFT", ui.listBtn, "RIGHT", 8, 0)
-	ui.enterBtn = Button(rc, "Enter  (me)", half, 24, function() RC:DoPersonalEnter() end, false,
-		"Join the round yourself.")
-	ui.enterBtn:SetPoint("TOPLEFT", ui.listBtn, "BOTTOMLEFT", 0, -6)
-	ui.rollBtn = Button(rc, "Roll  (me)", INNER - half - 8, 24, function() RC:DoPersonalRoll() end, false,
-		"Do your /roll for this round.")
-	ui.rollBtn:SetPoint("LEFT", ui.enterBtn, "RIGHT", 8, 0)
+	ui.listBtn, ui.resetBtn = ButtonRow(rc, CARD_PAD, -CARD_TITLE - 38, INNER, 24, {
+		{ "List Remaining", function() RC:ListRemaining() end, false, "Post who still has to roll, plus the current high and low." },
+		{ "Reset Round", function() RC:ResetRound() end },
+	})
+	ui.enterBtn, ui.rollBtn = ButtonRow(rc, CARD_PAD, -CARD_TITLE - 68, INNER, 24, {
+		{ "Enter  (me)", function() RC:DoPersonalEnter() end, false, "Join the round yourself." },
+		{ "Roll  (me)", function() RC:DoPersonalRoll() end, false, "Do your /roll for this round." },
+	})
 
-	-- ===== Stats card =====
-	local st = Card(f, "Stats")
-	st:SetPoint("TOPLEFT", rc, "BOTTOMLEFT", 0, -CARD_GAP)
-	st:SetPoint("RIGHT", f, "RIGHT", -PAD, 0)
-	st:SetHeight(CARD_TITLE + 24 + CARD_PAD)
-	local third = floor((INNER - 16) / 3)
-	ui.statsPeriod = Text(st, 11, "muted", false, "RIGHT")
-	ui.statsPeriod:SetPoint("TOPRIGHT", -CARD_PAD, -11)
-	ui.topBtn = Button(st, "Post Top 5", third, 24, function() RC:PostLeaderboard("top") end, false,
-		"Post the biggest winners for the period chosen in History.")
-	ui.topBtn:SetPoint("TOPLEFT", CARD_PAD, -CARD_TITLE)
-	ui.bottomBtn = Button(st, "Post Bottom 5", third, 24, function() RC:PostLeaderboard("bottom") end, false,
-		"Post the biggest losers for the period chosen in History.")
-	ui.bottomBtn:SetPoint("LEFT", ui.topBtn, "RIGHT", 8, 0)
-	local histBtn = Button(st, "History", INNER - 2 * third - 16, 24, function() RC:ToggleHistory() end, false,
-		"Leaderboard, round log, summaries and clean-up for any period.")
-	histBtn:SetPoint("LEFT", ui.bottomBtn, "RIGHT", 8, 0)
+	-- Stats
+	local st = Card(f, "Stats", rc, CARD_TITLE + 24 + CARD_PAD)
+	ui.statsPeriod = st.note
+	ui.topBtn, ui.bottomBtn = ButtonRow(st, CARD_PAD, -CARD_TITLE, INNER, 24, {
+		{ "Post Top 5", function() RC:PostLeaderboard("top") end, false, "Post the biggest winners for the period chosen in History." },
+		{ "Post Bottom 5", function() RC:PostLeaderboard("bottom") end, false, "Post the biggest losers for the period chosen in History." },
+		{ "History", function() RC:ToggleHistory() end, false, "Leaderboard, round log, summaries and clean-up for any period." },
+	})
 
-	-- ===== The Action card (fills the rest) =====
-	local act = Card(f, "The Action")
-	act:SetPoint("TOPLEFT", st, "BOTTOMLEFT", 0, -CARD_GAP)
+	-- The Action (fills the rest)
+	local act = Card(f, "The Action", st)
 	act:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -PAD, FOOTER + 6)
-	ui.actionCount = Text(act, 11, "muted", false, "RIGHT")
-	ui.actionCount:SetPoint("TOPRIGHT", -CARD_PAD, -11)
-
-	local scroll = CreateFrame("ScrollFrame", nil, act)
-	scroll:SetPoint("TOPLEFT", CARD_PAD, -CARD_TITLE)
-	scroll:SetPoint("BOTTOMRIGHT", -CARD_PAD, CARD_PAD)
-	scroll:EnableMouseWheel(true)
-	scroll:SetScript("OnMouseWheel", function(self, delta)
-		local maxScroll = math.max(0, ui.listChild:GetHeight() - self:GetHeight())
-		self:SetVerticalScroll(math.min(maxScroll, math.max(0, self:GetVerticalScroll() - delta * ROW_H * 2)))
-	end)
-	ui.listChild = CreateFrame("Frame", nil, scroll)
-	ui.listChild:SetSize(INNER, 1)
-	scroll:SetScrollChild(ui.listChild)
-	ui.empty = Text(act, 12, "muted", false, "CENTER")
-	ui.empty:SetPoint("CENTER", scroll, "CENTER")
+	ui.actionCount = act.note
+	ui.listChild, ui.empty = ScrollList(act, -CARD_TITLE, INNER, ROW_H * 2)
 
 	f:SetScript("OnShow", function()
 		RepaintAll()
 		RC:RebuildGameGroup()
 		RC:UpdateActionList()
 	end)
-
-	self:RebuildGameGroup()
-	self:UpdateActionList()
 end
 
-function RC:ShowWindow()
-	self:BuildWindow()
-	self.ui.frame:Show()
-end
-
-function RC:HideWindow()
-	if self.ui and self.ui.frame then self.ui.frame:Hide() end
-end
-
+function RC:ShowWindow() self:BuildWindow(); self.ui.frame:Show() end
+function RC:HideWindow() if self.ui then self.ui.frame:Hide() end end
 function RC:ToggleWindow()
-	if self.ui and self.ui.frame and self.ui.frame:IsShown() then
-		self:HideWindow()
-	else
-		self:ShowWindow()
-	end
+	if self.ui and self.ui.frame:IsShown() then self:HideWindow() else self:ShowWindow() end
 end
 
-------------------------------------------------------------------------
---  History window: leaderboard + round log for a chosen period
-------------------------------------------------------------------------
+--==========================================================================
+--  HISTORY WINDOW  (leaderboard + round log for a chosen period)
+--==========================================================================
 
-local HIST_W, HIST_H = 600, 640
+local HIST_W, HIST_H, LB_H, LOG_ROW, ARM_SECONDS = 600, 640, 280, 22, 3
 local HIST_INNER = HIST_W - PAD * 2 - CARD_PAD * 2
-local LB_H = 280
-local LOG_ROW = 22
-local ARM_SECONDS = 3
-
 -- Leaderboard columns, right-aligned, measured from the row's right edge.
 local LB_COLS = {
-	{ key = "worst",  title = "Worst",  w = 64, right = 0 },
-	{ key = "best",   title = "Best",   w = 64, right = 70 },
-	{ key = "wl",     title = "W / L",  w = 56, right = 140 },
-	{ key = "rounds", title = "Rounds", w = 56, right = 202 },
-	{ key = "net",    title = "Net",    w = 84, right = 264 },
+	{ key = "worst", title = "WORST", w = 64, right = 0 },
+	{ key = "best", title = "BEST", w = 64, right = 70 },
+	{ key = "wl", title = "W / L", w = 56, right = 140 },
+	{ key = "rounds", title = "ROUNDS", w = 56, right = 202 },
+	{ key = "net", title = "NET", w = 84, right = 264 },
 }
 local LB_NAME_RIGHT = 356
 
@@ -1354,8 +1132,7 @@ local function Arm(btn, armedText, restText, onConfirm)
 	if btn.armed then
 		btn.armed = nil
 		btn:SetText(restText)
-		onConfirm()
-		return
+		return onConfirm()
 	end
 	btn.armed = true
 	btn:SetText(armedText)
@@ -1364,40 +1141,10 @@ local function Arm(btn, armedText, restText, onConfirm)
 	end)
 end
 
-local function SetRGB(fs, c) fs:SetTextColor(c.r, c.g, c.b, 1) end
+local function NetColor(T, n) return n > 0 and WIN_RGB or n < 0 and LOSE_RGB or T.muted end
 
-local function NetColor(T, n)
-	if n > 0 then return WIN_RGB elseif n < 0 then return LOSE_RGB end
-	return T.muted
-end
-
-local function HistoryScroll(card, top)
-	local scroll = CreateFrame("ScrollFrame", nil, card)
-	scroll:SetPoint("TOPLEFT", CARD_PAD, top)
-	scroll:SetPoint("BOTTOMRIGHT", -CARD_PAD, CARD_PAD)
-	local child = CreateFrame("Frame", nil, scroll)
-	child:SetSize(HIST_INNER, 1)
-	scroll:SetScrollChild(child)
-	scroll:EnableMouseWheel(true)
-	scroll:SetScript("OnMouseWheel", function(self, delta)
-		local maxScroll = math.max(0, child:GetHeight() - self:GetHeight())
-		self:SetVerticalScroll(math.min(maxScroll, math.max(0, self:GetVerticalScroll() - delta * LOG_ROW * 3)))
-	end)
-	return scroll, child
-end
-
-local function LeaderRow(h, i)
-	local row = h.lbRows[i]
-	if row then return row end
-	row = CreateFrame("Frame", nil, h.lbChild)
-	row:SetHeight(LOG_ROW)
-	row:SetPoint("TOPLEFT", 0, -(i - 1) * LOG_ROW)
-	row:SetPoint("RIGHT", h.lbChild, "RIGHT")
-	row.stripe = row:CreateTexture(nil, "BACKGROUND")
-	row.stripe:SetAllPoints()
-	row.rank = Text(row, 11, "muted", false, "RIGHT")
-	row.rank:SetPoint("LEFT", 0, 0)
-	row.rank:SetWidth(22)
+local function BuildLeaderRow(row)
+	RankText(row)
 	row.name = Text(row, 12, "fg", false, "LEFT")
 	row.name:SetPoint("LEFT", row.rank, "RIGHT", 8, 0)
 	row.name:SetPoint("RIGHT", row, "RIGHT", -LB_NAME_RIGHT, 0)
@@ -1409,20 +1156,26 @@ local function LeaderRow(h, i)
 		fs:SetWidth(col.w)
 		row.cols[col.key] = fs
 	end
-	h.lbRows[i] = row
-	return row
 end
 
-local function LogRow(h, i)
-	local row = h.logRows[i]
-	if row then return row end
-	row = CreateFrame("Frame", nil, h.logChild)
-	row:SetHeight(LOG_ROW)
-	row:SetPoint("TOPLEFT", 0, -(i - 1) * LOG_ROW)
-	row:SetPoint("RIGHT", h.logChild, "RIGHT")
+local function RoundTooltip(row)
+	local rec = row.rec
+	if not rec or rec.legacy then return end
+	GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
+	GameTooltip:AddLine(date("%A %d %B  %H:%M", rec.t), 1, 1, 1)
+	GameTooltip:AddLine(format("Stakes %s  (1-%d, %d : 1)", Gold((rec.cap or 0) / (rec.ratio or 1)), rec.cap or 0, rec.ratio or 1), 0.7, 0.7, 0.7)
+	for _, pl in ipairs(rec.players or {}) do
+		local d = rec.deltas and rec.deltas[pl.n] or 0
+		local c = d > 0 and WIN_RGB or d < 0 and LOSE_RGB or { r = 0.9, g = 0.9, b = 0.9 }
+		GameTooltip:AddDoubleLine(pl.n, tostring(pl.r), c.r, c.g, c.b, c.r, c.g, c.b)
+	end
+	GameTooltip:Show()
+end
+
+local function BuildLogRow(row)
 	row:EnableMouse(true)
-	row.stripe = row:CreateTexture(nil, "BACKGROUND")
-	row.stripe:SetAllPoints()
+	row:SetScript("OnEnter", RoundTooltip)
+	row:SetScript("OnLeave", GameTooltip_Hide or function() GameTooltip:Hide() end)
 	row.when = Text(row, 11, "muted", false, "LEFT")
 	row.when:SetPoint("LEFT", 2, 0)
 	row.when:SetWidth(92)
@@ -1440,38 +1193,19 @@ local function LogRow(h, i)
 	row.result:SetPoint("LEFT", row.when, "RIGHT", 6, 0)
 	row.result:SetPoint("RIGHT", row.amount, "LEFT", -8, 0)
 	row.result:SetWordWrap(false)
-	-- Hover: every roll of the round.
-	row:SetScript("OnEnter", function(self)
-		local rec = self.rec
-		if not rec or rec.legacy then return end
-		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-		GameTooltip:AddLine(date("%A %d %B  %H:%M", rec.t), 1, 1, 1)
-		GameTooltip:AddLine(format("Stakes %s  (1-%d, %d : 1)", Gold((rec.cap or 0) / (rec.ratio or 1)), rec.cap or 0, rec.ratio or 1), 0.7, 0.7, 0.7)
-		for _, pl in ipairs(rec.players or {}) do
-			local d = rec.deltas and rec.deltas[pl.n]
-			local c = (d and d > 0 and WIN_RGB) or (d and d < 0 and LOSE_RGB) or { r = 0.9, g = 0.9, b = 0.9 }
-			GameTooltip:AddDoubleLine(pl.n, tostring(pl.r), c.r, c.g, c.b, c.r, c.g, c.b)
-		end
-		GameTooltip:Show()
-	end)
-	row:SetScript("OnLeave", function() GameTooltip:Hide() end)
-	h.logRows[i] = row
-	return row
 end
 
 local function ResultText(T, rec)
 	if rec.legacy then return Hex(T.muted) .. "Imported totals from before 2.2|r" end
 	if rec.tie then return Hex(T.muted) .. "Tie - no payout|r" end
-	local each = (#(rec.losers or {}) + #(rec.winners or {}) > 2) and Hex(T.muted) .. " each|r" or ""
-	return Hex(LOSE_RGB) .. table.concat(rec.losers or {}, ", ") .. "|r" .. Hex(T.muted) .. "  owes  |r"
-		.. Hex(WIN_RGB) .. table.concat(rec.winners or {}, ", ") .. "|r" .. each
+	return Hex(LOSE_RGB) .. concat(rec.losers or {}, ", ") .. "|r" .. Hex(T.muted) .. "  owes  |r"
+		.. Hex(WIN_RGB) .. concat(rec.winners or {}, ", ") .. "|r" .. (Each(rec) and Hex(T.muted) .. " each|r" or "")
 end
 
 function RC:RefreshHistory()
 	local h = self.hist
-	if not h or not h.frame or not h.frame:IsShown() then return end
-	local T = Theme()
-	local period = db.profile.histPeriod
+	if not h or not h.frame:IsShown() then return end
+	local T, period = Theme(), db.profile.histPeriod
 	local order, totals = self:Aggregate(period)
 
 	h.periodDrop:Refresh()
@@ -1483,53 +1217,42 @@ function RC:RefreshHistory()
 		Gold(totals.moved)))
 	h.lbCount:SetText(#order > 0 and format("%d %s", #order, Plural(#order, "player", "players")) or "")
 
-	-- Leaderboard
 	for i, p in ipairs(order) do
-		local row = LeaderRow(h, i)
-		row:Show()
-		row.stripe:SetColorTexture(T.fg.r, T.fg.g, T.fg.b, (i % 2 == 0) and 0.025 or 0)
+		local row = PoolRow(h.lbRows, h.lbChild, i, LOG_ROW, BuildLeaderRow)
+		local c = row.cols
 		row.rank:SetText(i .. ".")
 		row.name:SetText(p.name)
-		row.cols.net:SetText(Gold(p.net, true))
-		SetRGB(row.cols.net, NetColor(T, p.net))
-		row.cols.rounds:SetText(p.rounds > 0 and tostring(p.rounds) or "-")
-		row.cols.wl:SetText(p.rounds > 0 and format("%d / %d", p.wins, p.losses) or "-")
-		row.cols.best:SetText(p.best > 0 and Gold(p.best, true) or "-")
-		row.cols.worst:SetText(p.worst < 0 and Gold(p.worst, true) or "-")
-		SetRGB(row.cols.rounds, T.fg); SetRGB(row.cols.wl, T.muted)
-		SetRGB(row.cols.best, p.best > 0 and WIN_RGB or T.muted)
-		SetRGB(row.cols.worst, p.worst < 0 and LOSE_RGB or T.muted)
+		c.net:SetText(Gold(p.net, true))
+		c.rounds:SetText(p.rounds > 0 and tostring(p.rounds) or "-")
+		c.wl:SetText(p.rounds > 0 and format("%d / %d", p.wins, p.losses) or "-")
+		c.best:SetText(p.best > 0 and Gold(p.best, true) or "-")
+		c.worst:SetText(p.worst < 0 and Gold(p.worst, true) or "-")
+		SetRGB(c.net, NetColor(T, p.net))
+		SetRGB(c.rounds, T.fg)
+		SetRGB(c.wl, T.muted)
+		SetRGB(c.best, p.best > 0 and WIN_RGB or T.muted)
+		SetRGB(c.worst, p.worst < 0 and LOSE_RGB or T.muted)
 	end
-	for i = #order + 1, #h.lbRows do h.lbRows[i]:Hide() end
-	h.lbChild:SetHeight(math.max(1, #order * LOG_ROW))
+	HidePool(h.lbRows, #order + 1)
+	h.lbChild:SetHeight(max(1, #order * LOG_ROW))
 	h.lbEmpty:SetShown(#order == 0)
 
-	-- Round log, newest first
-	local recs = {}
-	local all = Rounds()
-	for i = #all, 1, -1 do
+	local all, recs = Rounds(), {}
+	for i = #all, 1, -1 do   -- newest first
 		if InPeriod(all[i], period) then recs[#recs + 1] = all[i] end
 	end
 	for i, rec in ipairs(recs) do
-		local row = LogRow(h, i)
-		row:Show()
-		row.rec = rec
-		row.del.armed = nil
+		local row = PoolRow(h.logRows, h.logChild, i, LOG_ROW, BuildLogRow)
+		row.rec, row.del.armed = rec, nil
 		row.del:SetText("x")
-		row.stripe:SetColorTexture(T.fg.r, T.fg.g, T.fg.b, (i % 2 == 0) and 0.025 or 0)
 		row.when:SetText(rec.legacy and "-" or date("%d %b  %H:%M", rec.t))
 		row.result:SetText(ResultText(T, rec))
-		if rec.legacy or rec.tie then
-			row.amount:SetText("-")
-			SetRGB(row.amount, T.muted)
-		else
-			row.amount:SetText(Gold(rec.each))
-			SetRGB(row.amount, T.accent)
-		end
+		row.amount:SetText((rec.legacy or rec.tie) and "-" or Gold(rec.each))
+		SetRGB(row.amount, (rec.legacy or rec.tie) and T.muted or T.accent)
 		row.post:SetShown(not rec.legacy)
 	end
-	for i = #recs + 1, #h.logRows do h.logRows[i]:Hide() end
-	h.logChild:SetHeight(math.max(1, #recs * LOG_ROW))
+	HidePool(h.logRows, #recs + 1)
+	h.logChild:SetHeight(max(1, #recs * LOG_ROW))
 	h.logEmpty:SetShown(#recs == 0)
 	h.logCount:SetText(#recs > 0 and format("%d %s", #recs, Plural(#recs, "round", "rounds")) or "")
 	h.clearBtn.armed = nil
@@ -1538,140 +1261,60 @@ function RC:RefreshHistory()
 end
 
 function RC:BuildHistory()
-	if self.hist and self.hist.frame then return end
+	if self.hist then return end
 	local h = { lbRows = {}, logRows = {} }
 	self.hist = h
-
-	local f = CreateFrame("Frame", "HiLoCasinoHistory", UIParent)
-	f:Hide()
-	f:SetSize(HIST_W, HIST_H)
-	f:SetFrameStrata("HIGH")
-	f:SetToplevel(true)
-	f:SetClampedToScreen(true)
-	f:SetMovable(true)
-	f:EnableMouse(true)
-	f:RegisterForDrag("LeftButton")
-	f:SetScript("OnDragStart", f.StartMoving)
-	f:SetScript("OnDragStop", function(self)
-		self:StopMovingOrSizing()
-		local point, _, relPoint, x, y = self:GetPoint()
-		db.profile.historyWindow = { point, relPoint, x, y }
+	local f = Window("HiLoCasinoHistory", HIST_W, HIST_H, "historyWindow", "Casino", "History", function(w)
+		if RC.ui and RC.ui.frame:IsShown() then w:SetPoint("TOPLEFT", RC.ui.frame, "TOPRIGHT", 6, 0) else w:SetPoint("CENTER") end
 	end)
-	local pos = db.profile.historyWindow
-	if type(pos) == "table" and pos[1] then
-		f:SetPoint(pos[1], UIParent, pos[2], pos[3], pos[4])
-	elseif self.ui and self.ui.frame and self.ui.frame:IsShown() then
-		f:SetPoint("TOPLEFT", self.ui.frame, "TOPRIGHT", 6, 0)
-	else
-		f:SetPoint("CENTER")
-	end
-	tinsert(UISpecialFrames, "HiLoCasinoHistory")
-	h.frame = f
-
-	local bg = f:CreateTexture(nil, "BACKGROUND", nil, -8)
-	bg:SetAllPoints()
-	local headTint = f:CreateTexture(nil, "BACKGROUND", nil, -7)
-	headTint:SetPoint("TOPLEFT")
-	headTint:SetPoint("BOTTOMRIGHT", f, "TOPRIGHT", 0, -HEADER)
-	local outer = Border(f, "OVERLAY")
-	local rule = f:CreateTexture(nil, "ARTWORK")
-	rule:SetPoint("TOPLEFT", 0, -HEADER)
-	rule:SetPoint("TOPRIGHT", 0, -HEADER)
-	Paint(function(T)
-		bg:SetColorTexture(T.bg.r, T.bg.g, T.bg.b, BACKDROP_ALPHA)
-		headTint:SetColorTexture(T.panel.r, T.panel.g, T.panel.b, 0.6)
-		outer:SetColor(0, 0, 0, 1)
-		outer.Fit()
-		rule:SetColorTexture(0, 0, 0, 1)
-		rule:SetHeight(Px(f))
-	end)
-
-	local logo = f:CreateTexture(nil, "ARTWORK")
-	logo:SetSize(32, 32)
-	logo:SetPoint("LEFT", f, "TOPLEFT", PAD, -HEADER / 2)
-	logo:SetTexture(ICON)
-	local title = Text(f, 20, "fg", true, "LEFT")
-	title:SetPoint("TOPLEFT", logo, "TOPRIGHT", 10, 1)
-	Paint(function(T) title:SetText("Casino " .. Hex(T.accent) .. "History|r") end)
-	h.subtitle = Text(f, 11, "muted", false, "LEFT")
-	h.subtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -2)
-	h.subtitle:SetPoint("RIGHT", f, "RIGHT", -44, 0)
-	h.subtitle:SetWordWrap(false)
-	local close = Button(f, "x", 24, 24, function() f:Hide() end)
-	close:SetPoint("RIGHT", f, "TOPRIGHT", -8, -HEADER / 2)
+	h.frame, h.subtitle, h.stored = f, f.subtitle, f.footRight
+	f.footLeft:SetText("Hover a round for every roll")
 
 	-- Toolbar: period, count, post buttons.
 	local y = -HEADER - PAD
-	local periodDW, countDW, gap = 150, 84, 8
-	local postW = floor((HIST_W - PAD * 2 - periodDW - countDW - gap * 4) / 3)
-	h.periodDrop = Dropdown(f, periodDW, 26, PERIODS,
-		function() return db.profile.histPeriod end,
-		function(v) db.profile.histPeriod = v; RC:RefreshHistory(); RC:RefreshControls() end)
+	h.periodDrop = Dropdown(f, 150, 26, PERIODS, Get("histPeriod"), Put("histPeriod"))
 	h.periodDrop:SetPoint("TOPLEFT", PAD, y)
-	h.countDrop = Dropdown(f, countDW, 26, { { 3, "Top 3" }, { 5, "Top 5" }, { 10, "Top 10" } },
-		function() return db.profile.topN end,
-		function(v) db.profile.topN = v; RC:RefreshHistory(); RC:RefreshControls() end)
-	h.countDrop:SetPoint("LEFT", h.periodDrop, "RIGHT", gap, 0)
-	h.topBtn = Button(f, "Post Top 5", postW, 26, function() RC:PostLeaderboard("top") end, true,
-		"Post the biggest winners for the selected period.")
-	h.topBtn:SetPoint("LEFT", h.countDrop, "RIGHT", gap, 0)
-	h.bottomBtn = Button(f, "Post Bottom 5", postW, 26, function() RC:PostLeaderboard("bottom") end, false,
-		"Post the biggest losers for the selected period.")
-	h.bottomBtn:SetPoint("LEFT", h.topBtn, "RIGHT", gap, 0)
-	local summary = Button(f, "Post Summary", postW, 26, function() RC:PostSummary() end, false,
-		"Post rounds played, gold that changed hands, the biggest round and the luckiest/unluckiest player.")
-	summary:SetPoint("LEFT", h.bottomBtn, "RIGHT", gap, 0)
+	h.countDrop = Dropdown(f, 84, 26, TOP_COUNTS, Get("topN"), Put("topN"))
+	h.countDrop:SetPoint("LEFT", h.periodDrop, "RIGHT", 8, 0)
+	h.topBtn, h.bottomBtn = ButtonRow(f, PAD + 250, y, HIST_W - PAD * 2 - 250, 26, {
+		{ "Post Top 5", function() RC:PostLeaderboard("top") end, true, "Post the biggest winners for the selected period." },
+		{ "Post Bottom 5", function() RC:PostLeaderboard("bottom") end, false, "Post the biggest losers for the selected period." },
+		{ "Post Summary", function() RC:PostSummary() end, false,
+			"Post rounds played, gold that changed hands, the biggest round and the luckiest/unluckiest player." },
+	})
 
-	-- Leaderboard card.
-	local lb = Card(f, "Leaderboard")
-	lb:SetPoint("TOPLEFT", PAD, y - 26 - PAD)
-	lb:SetPoint("RIGHT", f, "RIGHT", -PAD, 0)
-	lb:SetHeight(LB_H)
-	h.lbCount = Text(lb, 11, "muted", false, "RIGHT")
-	h.lbCount:SetPoint("TOPRIGHT", -CARD_PAD, -11)
-	local headerY = -CARD_TITLE + 2
-	local playerHead = Text(lb, 10, "muted", false, "LEFT")
-	playerHead:SetPoint("TOPLEFT", CARD_PAD + 30, headerY)
-	playerHead:SetText("PLAYER")
+	-- Leaderboard
+	local lb = Card(f, "Leaderboard", y - 26 - PAD, LB_H)
+	h.lbCount = lb.note
+	local headY = -CARD_TITLE + 2
+	FieldLabel(lb, "PLAYER", CARD_PAD + 30, headY, 10)
 	for _, col in ipairs(LB_COLS) do
 		local fs = Text(lb, 10, "muted", false, "RIGHT")
-		fs:SetPoint("TOPRIGHT", lb, "TOPRIGHT", -CARD_PAD - col.right - 4, headerY)
+		fs:SetPoint("TOPRIGHT", lb, "TOPRIGHT", -CARD_PAD - col.right - 4, headY)
 		fs:SetWidth(col.w)
-		fs:SetText(col.title:upper())
+		fs:SetText(col.title)
 	end
-	local lbScroll
-	lbScroll, h.lbChild = HistoryScroll(lb, headerY - 16)
-	h.lbEmpty = Text(lb, 12, "muted", false, "CENTER")
-	h.lbEmpty:SetPoint("CENTER", lbScroll, "CENTER")
+	h.lbChild, h.lbEmpty = ScrollList(lb, headY - 16, HIST_INNER, LOG_ROW * 3)
 	h.lbEmpty:SetText("No rounds in this period yet.")
 
-	-- Round log card.
-	local log = Card(f, "Rounds")
-	log:SetPoint("TOPLEFT", lb, "BOTTOMLEFT", 0, -CARD_GAP)
+	-- Round log
+	local log = Card(f, "Rounds", lb)
 	log:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -PAD, FOOTER + 6)
 	h.clearBtn = Button(log, "Clear period", 96, 20, function(btn)
 		local n = RC:CountPeriod(db.profile.histPeriod)
-		if n == 0 then return end
-		Arm(btn, format("Delete %d?", n), "Clear period", function() RC:ClearPeriod(db.profile.histPeriod) end)
+		if n > 0 then
+			Arm(btn, format("Delete %d?", n), "Clear period", function() RC:ClearPeriod(db.profile.histPeriod) end)
+		end
 	end, false, "Delete every round in the selected period (click twice to confirm).")
 	h.clearBtn:SetPoint("TOPRIGHT", -CARD_PAD, -6)
 	local newSession = Button(log, "New session", 96, 20, function() RC:NewSession() end, false,
 		"Start counting \"This session\" from now. Nothing is deleted.")
 	newSession:SetPoint("RIGHT", h.clearBtn, "LEFT", -6, 0)
-	h.logCount = Text(log, 11, "muted", false, "RIGHT")
-	h.logCount:SetPoint("RIGHT", newSession, "LEFT", -10, 0)
-	local logScroll
-	logScroll, h.logChild = HistoryScroll(log, -CARD_TITLE)
-	h.logEmpty = Text(log, 12, "muted", false, "CENTER")
-	h.logEmpty:SetPoint("CENTER", logScroll, "CENTER")
+	h.logCount = log.note
+	log.note:ClearAllPoints()
+	log.note:SetPoint("RIGHT", newSession, "LEFT", -10, 0)
+	h.logChild, h.logEmpty = ScrollList(log, -CARD_TITLE, HIST_INNER, LOG_ROW * 3)
 	h.logEmpty:SetText("No rounds in this period yet.")
-
-	-- Footer.
-	local hint = Text(f, 10, "muted", false, "LEFT")
-	hint:SetPoint("BOTTOMLEFT", PAD + 2, 6)
-	hint:SetText("Hover a round for every roll")
-	h.stored = Text(f, 10, "muted", false, "RIGHT")
-	h.stored:SetPoint("BOTTOMRIGHT", -PAD - 2, 6)
 
 	f:SetScript("OnShow", function()
 		RepaintAll()
@@ -1685,136 +1328,229 @@ function RC:ToggleHistory()
 end
 
 --==========================================================================
---  CHAT EVENT HANDLERS
+--  OPTIONS PANEL  (Options > AddOns > Hi-Lo Casino, the gear buttons,
+--  /hilo options, or Ctrl-click the minimap icon)
 --==========================================================================
 
-local function entryAllowed(method)
-	return round and round.acceptEntries and db.profile.chatMethod == method
+local OPT_LABEL_W, OPT_CTRL_W, OPT_ROW = 120, 150, 34
+
+function RC:BuildOptions()
+	if self.options or not (Settings and Settings.RegisterCanvasLayoutCategory) then return end
+	local panel, controls = CreateFrame("Frame"), {}
+	panel.controls = controls
+	self.options = panel
+	function panel:Refresh() for _, c in pairs(controls) do c:Refresh() end end
+
+	local logo = panel:CreateTexture(nil, "ARTWORK")
+	logo:SetSize(36, 36)
+	logo:SetPoint("TOPLEFT", PAD + 4, -14)
+	logo:SetTexture(ICON)
+	local title = Text(panel, 20, "fg", true, "LEFT")
+	title:SetPoint("TOPLEFT", logo, "TOPRIGHT", 10, -1)
+	Paint(function(T) title:SetText("Hi-Lo " .. Hex(T.accent) .. "Casino|r  " .. Hex(T.muted) .. Version() .. "|r") end)
+	FieldLabel(panel, "Settings save automatically. Text fields apply when you press Enter or click away.",
+		PAD + 50, -38)
+
+	-- Two columns of cards.
+	local function Column(title_, left, y, height)
+		local card = Card(panel, title_, nil, height)
+		card:SetPoint("TOPLEFT", panel, left and "TOPLEFT" or "TOP", left and PAD or PAD / 2, y)
+		card:SetPoint("RIGHT", panel, left and "CENTER" or "RIGHT", left and -PAD / 2 or -PAD, 0)
+		return card
+	end
+	local function Row(card, i, label, control, key)
+		FieldLabel(card, label, CARD_PAD, -CARD_TITLE - (i - 1) * OPT_ROW - 6, 12, "fg")
+		control:SetPoint("TOPLEFT", CARD_PAD + OPT_LABEL_W, -CARD_TITLE - (i - 1) * OPT_ROW)
+		controls[key] = control
+	end
+	local function TextOption(card, i, label, key, numeric)
+		local box = Field(card, OPT_CTRL_W, 26, function(b, text) RC:Set(key, text); b:Refresh() end, Get(key))
+		if numeric then box:SetNumeric(true) end
+		Row(card, i, label, box, key)
+	end
+	local function ChoiceOption(card, i, label, key, list)
+		Row(card, i, label, Dropdown(card, OPT_CTRL_W, 26, list, Get(key), Put(key)), key)
+	end
+
+	local top = -64
+	local roundCard = Column("Round", true, top, CARD_TITLE + 4 * OPT_ROW + CARD_PAD)
+	TextOption(roundCard, 1, "Stakes (gold)", "stakesGold", true)
+	ChoiceOption(roundCard, 2, "Ratio (roll : gold)", "ratio", RATIOS)
+	ChoiceOption(roundCard, 3, "Broadcast to", "chatMethod", CHATS)
+	TextOption(roundCard, 4, "Custom channel", "customChannel")
+	roundCard.note:SetText("used by Start Round")
+
+	local words = Card(panel, "Chat keywords", roundCard, CARD_TITLE + 2 * OPT_ROW + CARD_PAD + 16)
+	words:SetPoint("RIGHT", roundCard, "RIGHT")
+	TextOption(words, 1, "Enter", "enterMsg")
+	TextOption(words, 2, "Withdraw", "withdrawMsg")
+	FieldLabel(words, "What players type in the broadcast channel.", CARD_PAD, -CARD_TITLE - 2 * OPT_ROW - 2)
+
+	local hist = Column("History", false, top, CARD_TITLE + 2 * OPT_ROW + CARD_PAD)
+	ChoiceOption(hist, 1, "Period", "histPeriod", PERIODS)
+	ChoiceOption(hist, 2, "Post count", "topN", TOP_COUNTS)
+	hist.note:SetText("for Post Top / Bottom")
+
+	local look = Card(panel, "Interface", hist, CARD_TITLE + OPT_ROW + 4 * 24 + 8 + 2 * 30 + CARD_PAD)
+	look:SetPoint("RIGHT", hist, "RIGHT")
+	ChoiceOption(look, 1, "Window scale", "scale", SCALES)
+	local toggles = {
+		{ "minimap", "Show minimap button", function() return not db.profile.minimap.hide end, function(v) RC:SetMinimapShown(v) end },
+		{ "lockWindows", "Lock window positions", Get("lockWindows"), Put("lockWindows") },
+		{ "clickSound", "Click sounds", Get("clickSound"), Put("clickSound") },
+		{ "loginMessage", "Message in chat on login", Get("loginMessage"), Put("loginMessage") },
+	}
+	for i, t in ipairs(toggles) do
+		local tg = Toggle(look, t[2], t[3], t[4])
+		tg:SetPoint("TOPLEFT", CARD_PAD, -CARD_TITLE - OPT_ROW - (i - 1) * 24)
+		controls[t[1]] = tg
+	end
+	local by, lookW = -CARD_TITLE - OPT_ROW - 4 * 24 - 8, OPT_LABEL_W + OPT_CTRL_W   -- same width as the rows
+	ButtonRow(look, CARD_PAD, by, lookW, 24, {
+		{ "Open window", function() RC:ShowWindow() end },
+		{ "Open history", function() RC:BuildHistory(); RC.hist.frame:Show() end },
+	})
+	ButtonRow(look, CARD_PAD, by - 30, lookW, 24, {
+		{ "Reset window positions", function() RC:ResetPositions() end, false, "Move both windows back to their default spots." },
+	})
+
+	panel:SetScript("OnShow", function() RepaintAll(); panel:Refresh() end)
+	self.optionsCategory = Settings.RegisterCanvasLayoutCategory(panel, "Hi-Lo Casino")
+	Settings.RegisterAddOnCategory(self.optionsCategory)
 end
 
-local function readable(...)
+function RC:OpenOptions()
+	if self.optionsCategory then
+		Settings.OpenToCategory(self.optionsCategory:GetID())
+	else
+		self:Print("The settings panel isn't available on this client.")
+	end
+end
+
+function RC:ResetPositions()
+	db.profile.window, db.profile.historyWindow = nil, nil
+	if self.ui then self.ui.frame:Place() end
+	if self.hist then self.hist.frame:Place() end
+	self:Print("Window positions reset.")
+end
+
+--==========================================================================
+--  CHAT EVENTS
+--==========================================================================
+
+local function Readable(...)
 	for i = 1, select("#", ...) do
 		local v = select(i, ...)
-		if v == nil or issecret(v) then return false end
+		if issecret(v) or v == nil then return false end
 	end
 	return true
 end
 
-function RC:Chat_RAID(event, text, sender)
-	if entryAllowed("RAID") and readable(text, sender) then self:ParseEntry(text, sender) end
+local function EntriesOpenFor(method)
+	return round and round.acceptEntries and db.profile.chatMethod == method
 end
-function RC:Chat_PARTY(event, text, sender)
-	if entryAllowed("PARTY") and readable(text, sender) then self:ParseEntry(text, sender) end
+
+local CHAT_EVENTS = {
+	RAID = { "CHAT_MSG_RAID", "CHAT_MSG_RAID_LEADER" }, PARTY = { "CHAT_MSG_PARTY", "CHAT_MSG_PARTY_LEADER" },
+	GUILD = { "CHAT_MSG_GUILD" }, SAY = { "CHAT_MSG_SAY" }, CHANNEL = { "CHAT_MSG_CHANNEL" }, SYSTEM = { "CHAT_MSG_SYSTEM" },
+}
+
+for _, method in ipairs({ "RAID", "PARTY", "GUILD", "SAY" }) do
+	RC["Chat_" .. method] = function(self, _, text, sender)
+		if EntriesOpenFor(method) and Readable(text, sender) then self:ParseEntry(text, sender) end
+	end
 end
-function RC:Chat_GUILD(event, text, sender)
-	if entryAllowed("GUILD") and readable(text, sender) then self:ParseEntry(text, sender) end
-end
-function RC:Chat_SAY(event, text, sender)
-	if entryAllowed("SAY") and readable(text, sender) then self:ParseEntry(text, sender) end
-end
-function RC:Chat_CHANNEL(event, ...)
-	if not entryAllowed("CHANNEL") then return end
-	local text, _, _, _, sender, _, _, _, channel = ...
-	if readable(text, sender, channel) and channel == db.profile.customChannel then
+
+function RC:Chat_CHANNEL(_, text, _, _, _, sender, _, _, _, channel)
+	if EntriesOpenFor("CHANNEL") and Readable(text, sender, channel) and channel == db.profile.customChannel then
 		self:ParseEntry(text, sender)
 	end
 end
-function RC:Chat_SYSTEM(event, text)
-	if round and round.acceptRolls and readable(text) then self:ParseRoll(text) end
+
+function RC:Chat_SYSTEM(_, text)
+	if round and round.acceptRolls and Readable(text) then self:ParseRoll(text) end
 end
 
 --==========================================================================
 --  SLASH COMMANDS
 --==========================================================================
 
+local HELP = {
+	"/hilo  - toggle the window",
+	"/hilo options  - open the settings",
+	"/hilo next  - advance the round phase",
+	"/hilo reset  - reset the current round",
+	"/hilo gold <n>  - set stakes in gold",
+	"/hilo ratio <n>  - set roll:gold ratio (e.g. 10 or 100)",
+	"/hilo channel <name>  - set custom chat channel",
+	"/hilo history  - leaderboard and round log",
+	"/hilo top [n] [period]  - post the top n winners (period: session, today, week, month, all)",
+	"/hilo bottom [n] [period]  - post the n biggest losers",
+	"/hilo summary [period]  - post a summary of the period",
+	"/hilo newsession  - start a new \"This session\"",
+	"/hilo minimap  - toggle the minimap button",
+	"/hilo version",
+}
+local PERIOD_ALIAS = { day = "today", alltime = "all" }
+
 function RC:SlashCmd(input)
 	local cmd, rest = self:GetArgs(input, 2)
 	cmd = cmd and strlower(cmd) or ""
-
 	if cmd == "" or cmd == "show" or cmd == "toggle" then
 		self:ToggleWindow()
 	elseif cmd == "hide" then
 		self:HideWindow()
+	elseif cmd == "options" or cmd == "config" or cmd == "settings" then
+		self:OpenOptions()
 	elseif cmd == "reset" then
 		self:ResetRound()
 		self:Print("Round reset.")
 	elseif cmd == "next" then
 		self:NextPhase()
-	elseif cmd == "gold" and tonumber(rest) then
-		db.profile.stakesGold = math.max(1, floor(tonumber(rest)))
-		if round.phase == 0 then round.stakes = self:RollCap() end
-		self:RefreshControls()
-		self:Print(format("Stakes set to %dg (roll 1-%d).", db.profile.stakesGold, self:RollCap()))
-	elseif cmd == "ratio" and tonumber(rest) then
-		db.profile.ratio = math.max(1, floor(tonumber(rest)))
-		if round.phase == 0 then round.stakes = self:RollCap() end
-		self:RefreshControls()
-		self:Print(format("Ratio set to %d:1 (roll 1-%d).", db.profile.ratio, self:RollCap()))
+	elseif (cmd == "gold" or cmd == "ratio") and tonumber(rest) then
+		self:Set(cmd == "gold" and "stakesGold" or "ratio", rest)
+		self:Print(format("Stakes %dg at %d : 1 (roll 1-%d).", db.profile.stakesGold, db.profile.ratio, self:RollCap()))
 	elseif cmd == "channel" and rest and rest ~= "" then
-		db.profile.customChannel = rest
-		self:Print("Custom channel set to: "..rest)
+		self:Set("customChannel", rest)
+		self:Print("Custom channel set to: " .. db.profile.customChannel)
 	elseif cmd == "minimap" then
-		db.profile.minimap.hide = not db.profile.minimap.hide
-		if LDBIcon then
-			if db.profile.minimap.hide then LDBIcon:Hide("HiLoCasino") else LDBIcon:Show("HiLoCasino") end
-		end
-		self:Print("Minimap button "..(db.profile.minimap.hide and "hidden" or "shown")..".")
+		self:SetMinimapShown(db.profile.minimap.hide)
+		self:Print("Minimap button " .. (db.profile.minimap.hide and "hidden" or "shown") .. ".")
 	elseif cmd == "history" or cmd == "stats" then
 		self:ToggleHistory()
 	elseif cmd == "top" or cmd == "bottom" or cmd == "summary" then
-		-- /rc top [n] [period]  - n and period in either order, both optional
+		-- /hilo top [n] [period]  - either order, both optional
 		local n, period
 		for word in (rest or ""):gmatch("%S+") do
 			word = strlower(word)
-			if tonumber(word) then n = math.max(1, math.min(25, floor(tonumber(word))))
-			elseif PERIOD_LABEL[word] then period = word
-			elseif word == "day" then period = "today"
-			elseif word == "alltime" then period = "all" end
+			if tonumber(word) then n = max(1, min(25, floor(tonumber(word))))
+			else period = PERIOD_LABEL[word] and word or PERIOD_ALIAS[word] or period end
 		end
 		if cmd == "summary" then self:PostSummary(period) else self:PostLeaderboard(cmd, n, period) end
 	elseif cmd == "newsession" then
 		self:NewSession()
 	elseif cmd == "version" then
-		self:Print("Hi-Lo Casino v"..(C_AddOns and C_AddOns.GetAddOnMetadata(ADDON, "Version") or GetAddOnMetadata(ADDON, "Version") or "2.0.0"))
+		self:Print("Hi-Lo Casino v" .. Version())
 	else
 		self:Print("|cffffff00Hi-Lo Casino commands:|r  (/rc works too)")
-		self:Print("/hilo  - toggle the window")
-		self:Print("/hilo next  - advance the round phase")
-		self:Print("/hilo reset  - reset the current round")
-		self:Print("/hilo gold <n>  - set stakes in gold")
-		self:Print("/hilo ratio <n>  - set roll:gold ratio (e.g. 10 or 100)")
-		self:Print("/hilo channel <name>  - set custom chat channel")
-		self:Print("/hilo history  - leaderboard and round log")
-		self:Print("/hilo top [n] [period]  - post the top n winners (period: session, today, week, month, all)")
-		self:Print("/hilo bottom [n] [period]  - post the n biggest losers")
-		self:Print("/hilo summary [period]  - post a summary of the period")
-		self:Print("/hilo newsession  - start a new \"This session\"")
-		self:Print("/hilo minimap  - toggle the minimap button")
-		self:Print("/hilo version")
+		for _, line in ipairs(HELP) do self:Print(line) end
 	end
 end
 
 --==========================================================================
---  ADDON LIFECYCLE
+--  LIFECYCLE
 --==========================================================================
 
 function RC:OnInitialize()
 	self.db = LibStub("AceDB-3.0"):New("HiLoCasinoDB", defaults, true)
 	db = self.db
 
-	-- Old default channel -> new default
-	if db.profile.customChannel == "RollGamble" then
-		db.profile.customChannel = "hilocasino"
-	end
-
-	-- Migrate v2.0 roll-cap setting -> gold amount
-	if db.profile.stakes then
-		db.profile.stakesGold = math.max(1, floor(db.profile.stakes / (db.profile.ratio or 100)))
+	if db.profile.customChannel == "RollGamble" then db.profile.customChannel = "hilocasino" end
+	if db.profile.stakes then   -- 2.0 stored the roll cap; now it's gold
+		db.profile.stakesGold = max(1, floor(db.profile.stakes / (db.profile.ratio or 100)))
 		db.profile.stakes = nil
 	end
-
-	-- 2.2: the old running totals (roll units, no per-round detail) become one
-	-- "imported totals" record that only counts toward All time.
+	-- 2.2: old running totals (roll units) become one "imported totals" record (All time only).
 	if not db.global.legacyImported then
 		local ratio, deltas, any = db.profile.ratio or 100, {}, false
 		for name, total in pairs(db.global.allTime or {}) do
@@ -1827,50 +1563,40 @@ function RC:OnInitialize()
 		if any then tinsert(Rounds(), 1, { legacy = true, t = 0, deltas = deltas }) end
 		db.global.legacyImported = true
 	end
-	if PERIOD_LABEL[db.profile.histPeriod] == nil then db.profile.histPeriod = "session" end
+	if not PERIOD_LABEL[db.profile.histPeriod] then db.profile.histPeriod = "session" end
 
-	round = NewRound()
-	round.stakes = self:RollCap()
+	round = NewRound(self:RollCap())
 
-	-- Minimap launcher
 	if LDB and LDBIcon then
-		local obj = LDB:NewDataObject("HiLoCasino", {
+		LDBIcon:Register("HiLoCasino", LDB:NewDataObject("HiLoCasino", {
 			type = "launcher",
 			text = "Hi-Lo Casino",
-			icon = "Interface\\AddOns\\HiLoCasino\\media\\icon",
+			icon = ICON,
 			OnClick = function(_, button)
-				if button == "RightButton" then
-					RC:PostLeaderboard("top")
-				elseif IsShiftKeyDown() then
-					RC:ToggleHistory()
-				else
-					RC:ToggleWindow()
-				end
+				if button == "RightButton" then RC:PostLeaderboard("top")
+				elseif IsControlKeyDown() then RC:OpenOptions()
+				elseif IsShiftKeyDown() then RC:ToggleHistory()
+				else RC:ToggleWindow() end
 			end,
 			OnTooltipShow = function(tt)
 				tt:AddLine("Hi-Lo Casino")
 				tt:AddLine("|cffffffffLeft-click:|r toggle window")
 				tt:AddLine("|cffffffffShift-click:|r history")
+				tt:AddLine("|cffffffffCtrl-click:|r settings")
 				tt:AddLine(format("|cffffffffRight-click:|r post top %d (%s)", db.profile.topN, RC:PeriodName(db.profile.histPeriod)))
 			end,
-		})
-		LDBIcon:Register("HiLoCasino", obj, db.profile.minimap)
+		}), db.profile.minimap)
 	end
 
-	self:RegisterChatCommand("rc", "SlashCmd")
-	self:RegisterChatCommand("hilo", "SlashCmd")
-	self:RegisterChatCommand("hilocasino", "SlashCmd")
+	for _, name in ipairs({ "rc", "hilo", "hilocasino" }) do self:RegisterChatCommand(name, "SlashCmd") end
+	self:BuildOptions()
 end
 
 function RC:OnEnable()
-	self:RegisterEvent("CHAT_MSG_RAID",        "Chat_RAID")
-	self:RegisterEvent("CHAT_MSG_RAID_LEADER", "Chat_RAID")
-	self:RegisterEvent("CHAT_MSG_PARTY",       "Chat_PARTY")
-	self:RegisterEvent("CHAT_MSG_PARTY_LEADER","Chat_PARTY")
-	self:RegisterEvent("CHAT_MSG_GUILD",       "Chat_GUILD")
-	self:RegisterEvent("CHAT_MSG_SAY",         "Chat_SAY")
-	self:RegisterEvent("CHAT_MSG_CHANNEL",     "Chat_CHANNEL")
-	self:RegisterEvent("CHAT_MSG_SYSTEM",      "Chat_SYSTEM")
-
-	self:Print("|cffffff00Hi-Lo Casino|r loaded. Type |cff59f0dc/hilo|r to open.")
+	for method, events in pairs(CHAT_EVENTS) do
+		for _, event in ipairs(events) do self:RegisterEvent(event, "Chat_" .. method) end
+	end
+	if db.profile.loginMessage then
+		self:Print("|cffffff00Hi-Lo Casino|r loaded. Type |cff59f0dc/hilo|r to open, |cff59f0dc/hilo options|r for settings.")
+	end
 end

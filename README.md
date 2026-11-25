@@ -26,6 +26,17 @@ Every finished round is stored. Open **History** to see, for *This session*, *To
 
 Post the **Top N**, **Bottom N** or a **Summary** to chat with one click.
 
+## Settings
+
+Everything can be set without typing commands: **Options → AddOns → Hi-Lo Casino**, the gear
+button in either window, Ctrl-click on the minimap icon, or `/hilo options`.
+
+- **Round**: stakes, roll:gold ratio, where to broadcast, custom channel name
+- **Chat keywords**: what players type to enter and withdraw
+- **History**: default period and how many players Top/Bottom posts list
+- **Interface**: window scale, minimap button, lock window positions, click sounds,
+  login message, reset window positions
+
 ## Commands
 
 Get it on [CurseForge](https://www.curseforge.com/wow/addons/hi-lo-casino) (project 1831355). Named *Roll Casino* before 2.2.0.
@@ -33,6 +44,7 @@ Get it on [CurseForge](https://www.curseforge.com/wow/addons/hi-lo-casino) (proj
 | Command | |
 |---|---|
 | `/hilo` | Toggle the window (`/rc` works too) |
+| `/hilo options` | Open the settings |
 | `/hilo history` | Leaderboard and round log |
 | `/hilo top [n] [period]` | Post the top *n* winners (period: `session`, `today`, `week`, `month`, `all`) |
 | `/hilo bottom [n] [period]` | Post the *n* biggest losers |
