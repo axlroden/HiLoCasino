@@ -41,7 +41,7 @@ local defaults = {
 		enterMsg = "1", withdrawMsg = "-1",
 		chatMethod = "RAID", customChannel = "hilocasino",
 		stakesGold = 20, ratio = 100, rulesName = "Hi/Lo",
-		histPeriod = "session", topN = 5,          -- overviews and the quick post buttons
+		histPeriod = "all", topN = 5,              -- overviews and the quick post buttons (all rounds by default)
 		minimap = { hide = false },
 		scale = 1, lockWindows = false, clickSound = true, loginMessage = true,
 	},
@@ -52,12 +52,22 @@ local personalEntered, personalRolled = false, false
 -- Chat lines an event handler may not send (Say outdoors, custom channels);
 -- posted by the "Announce Results" click.
 local pendingMsgs, deferChat
-local sessionStart = time()   -- "This session" = since login, or since "New session"
+local missed = { entries = 0, rolls = 0 }   -- chat lines hidden in combat (see CHAT EVENTS)
+-- "This session" = since you logged in, or since "New session". Saved, so a /reload
+-- keeps it; a fresh login starts a new one (PLAYER_ENTERING_WORLD below).
+local sessionStart = time()
 
 -- Chat payloads can be secret on this client (chat messaging lockdown);
 -- touching a secret string errors, so such messages are skipped.
 local issecret = issecretvalue or function() return false end
 local SendChat = (C_ChatInfo and C_ChatInfo.SendChatMessage) or SendChatMessage
+
+-- True while chat reaches us hidden: you're in combat (or chat lockdown). The
+-- round waits then - nothing typed or rolled could be read.
+local function ChatHidden()
+	local lockdown = C_ChatInfo and C_ChatInfo.InChatMessagingLockdown
+	return InCombatLockdown() or (lockdown and lockdown()) or false
+end
 
 local function Version()
 	return (C_AddOns and C_AddOns.GetAddOnMetadata or GetAddOnMetadata)(ADDON, "Version") or ""
@@ -250,8 +260,28 @@ function RC:ParseRoll(msg)
 	local p = key and round.entrants[key]
 	roll, lo, hi = tonumber(roll), tonumber(lo), tonumber(hi)
 	if not p or not p.entered or p.rolled or lo ~= 1 or hi ~= round.stakes or not roll or roll > hi then return end
+	self:AddRoll(key, roll, DisplayName(name))   -- the name as the game prints it
+end
 
-	p.rolled, p.roll, p.name = true, roll, DisplayName(name)   -- the name as the game prints it
+-- A roll you type in yourself (one the addon couldn't read, e.g. in combat).
+-- Returns an error text when it can't be taken.
+function RC:EnterRoll(name, roll)
+	roll = tonumber(roll)
+	if not round.acceptRolls then return "nobody is rolling right now" end
+	local key = name and FindEntrantKey(name)
+	local p = key and round.entrants[key]
+	if not p or not p.entered then return format("%s isn't in this round", name or "?") end
+	if p.rolled then return format("%s already rolled %d", p.name, p.roll) end
+	if not roll or roll ~= floor(roll) or roll < 1 or roll > round.stakes then
+		return format("the roll must be 1-%d", round.stakes)
+	end
+	self:Print(format("Entered %d for %s.", roll, p.name))
+	self:AddRoll(key, roll, nil, true)
+end
+
+function RC:AddRoll(key, roll, name, byHand)
+	local p = round.entrants[key]
+	p.rolled, p.roll, p.name, p.byHand = true, roll, name or p.name, byHand
 	local high, low = self:GetHighRoll(), self:GetLowRoll()
 	if not round.highRoller or roll > high then
 		round.highRoller, round.highTyers = key, { key }
@@ -264,7 +294,7 @@ function RC:ParseRoll(msg)
 		tinsert(round.lowTyers, key)
 	end
 
-	if self:GetRemainingToRollCount() == 0 then self:RoundWrapup() end
+	if self:GetRemainingToRollCount() == 0 then self:RoundWrapup(byHand) end
 	self:UpdateActionList()
 	self:RefreshControls()
 end
@@ -306,12 +336,24 @@ function RC:RecordRound(rec)
 	self:RefreshHistory()
 end
 
+-- What each player won (+) or lost (-) in a round. Every loser pays every winner
+-- the announced amount: "A, B owes C 5g each" = C gets 10g, "A owes B, C 5g each"
+-- = A pays 10g. Worked out from losers / winners so rounds saved earlier (which
+-- counted tied rounds only once) come out right too.
+local function RoundDeltas(rec)
+	if rec.legacy or not rec.each or not rec.losers or not rec.winners then return rec.deltas or {} end
+	local d = {}
+	for _, n in ipairs(rec.losers) do d[n] = (d[n] or 0) - rec.each * #rec.winners end
+	for _, n in ipairs(rec.winners) do d[n] = (d[n] or 0) + rec.each * #rec.losers end
+	return d
+end
+
 -- Per-player overview for a period (best net first) plus period totals.
 function RC:Aggregate(period)
 	local players, order = {}, {}
 	local totals = { rounds = 0, ties = 0, moved = 0 }
 	local function P(name)
-		local key = strlower(name)
+		local key = NameKey(name)
 		if not players[key] then
 			players[key] = { name = name, net = 0, rounds = 0, wins = 0, losses = 0, best = 0, worst = 0 }
 			order[#order + 1] = players[key]
@@ -328,7 +370,7 @@ function RC:Aggregate(period)
 					totals.biggest = rec
 				end
 			end
-			for name, d in pairs(rec.deltas or {}) do
+			for name, d in pairs(RoundDeltas(rec)) do
 				local p = P(name)
 				p.net = p.net + d
 				if not rec.legacy and d > 0 then
@@ -354,15 +396,24 @@ local function RoundResult(rec)
 		Gold(rec.each), Each(rec) and " each" or "")
 end
 
--- which = "top" (biggest winners) or "bottom" (biggest losers).
+-- which = "top" (biggest winners) or "bottom" (biggest losers). Only players who
+-- are up go on the top list and only players who are down on the bottom one.
 function RC:PostLeaderboard(which, n, period)
 	period, n = period or db.profile.histPeriod, n or db.profile.topN
 	local order = self:Aggregate(period)
 	if #order == 0 then return NoRounds(self, period) end
-	local count = min(n, #order)
-	self:ChatMsg(format(".:HiLo %s %d - %s:.", which == "bottom" and "Bottom" or "Top", count, self:PeriodName(period)))
+	local bottom, list = which == "bottom", {}
+	for i = 1, #order do
+		local p = order[bottom and #order - i + 1 or i]
+		if (bottom and p.net < 0) or (not bottom and p.net > 0) then list[#list + 1] = p end
+	end
+	if #list == 0 then
+		return self:Print(format("Nobody is %s for %s.", bottom and "down" or "up", self:PeriodName(period)))
+	end
+	local count = min(n, #list)
+	self:ChatMsg(format(".:HiLo %s %d - %s:.", bottom and "Bottom" or "Top", count, self:PeriodName(period)))
 	for i = 1, count do
-		local p = order[which == "bottom" and #order - i + 1 or i]
+		local p = list[i]
 		local detail = p.rounds == 0 and "imported"
 			or format("%d %s, %dW/%dL", p.rounds, Plural(p.rounds, "round", "rounds"), p.wins, p.losses)
 		self:ChatMsg(format("%d. %s  %s  (%s)", i, p.name, Gold(p.net, true), detail))
@@ -379,7 +430,7 @@ function RC:PostSummary(period)
 		self:ChatMsg(format(".:HiLo:. Biggest round: %s (%s)", RoundResult(t.biggest), date("%d %b %H:%M", t.biggest.t)))
 	end
 	local top, bottom = order[1], order[#order]
-	if top and top.net > 0 then
+	if top and top.net > 0 and bottom.net < 0 then
 		self:ChatMsg(format(".:HiLo:. Luckiest: %s %s  -  Unluckiest: %s %s",
 			top.name, Gold(top.net, true), bottom.name, Gold(bottom.net, true)))
 	end
@@ -421,6 +472,7 @@ end
 
 function RC:NewSession()
 	sessionStart = time()
+	db.global.sessionStart = sessionStart
 	self:Print("New session started - \"This session\" counts from now. History is kept.")
 	self:RefreshHistory()
 	self:RefreshControls()
@@ -451,8 +503,7 @@ function RC:ReportResults()
 		rec.each, rec.losers, rec.winners = each, {}, {}
 		for _, k in ipairs(round.lowTyers) do tinsert(rec.losers, round.entrants[k].name) end
 		for _, k in ipairs(round.highTyers) do tinsert(rec.winners, round.entrants[k].name) end
-		for _, n in ipairs(rec.losers) do rec.deltas[n] = (rec.deltas[n] or 0) - each end
-		for _, n in ipairs(rec.winners) do rec.deltas[n] = (rec.deltas[n] or 0) + each end
+		rec.deltas = RoundDeltas(rec)
 		self:ChatMsg(format(".:HiLo Payouts:. %s owes %s < %s >%s", concat(rec.losers, ", "),
 			concat(rec.winners, ", "), ConvertRollToGold(owed), split > 1 and " each." or ""))
 	else
@@ -464,14 +515,16 @@ end
 
 function RC:ResetRound()
 	round = NewRound(self:RollCap())
+	missed.entries, missed.rolls = 0, 0
 	personalEntered, personalRolled = false, false
 	self:UpdateActionList()
 	self:RefreshControls()
 end
 
-function RC:RoundWrapup()
-	-- Runs from the CHAT_MSG_SYSTEM roll event, so Say/channel lines are queued.
-	deferChat = true
+function RC:RoundWrapup(byHand)
+	-- Runs from the CHAT_MSG_SYSTEM roll event, so Say/channel lines are queued
+	-- (not for a roll you typed in: that is a keypress, which may post).
+	deferChat = not byHand
 	local ok, err = pcall(self.ReportResults, self)
 	deferChat = nil
 	self:ResetRound()
@@ -484,6 +537,9 @@ end
 function RC:NextPhase()
 	if self:FlushPending() then return end
 	local p = round.phase
+	if p < 3 and ChatHidden() then
+		return self:Print("You're in combat - the round waits until it's over (chat can't be read in combat).")
+	end
 	if p == 0 then
 		round = NewRound(self:RollCap())
 		round.acceptEntries = true
@@ -953,11 +1009,12 @@ function RC:RefreshControls()
 	local p, T, cap = round.phase, Theme(), round.stakes
 
 	ui.phaseBtn:SetText(pendingMsgs and "Announce Results" or PHASE_BUTTON[p] or PHASE_BUTTON[0])
-	ui.phaseBtn:SetDisabled(not pendingMsgs and p >= 3)
+	local paused = ChatHidden()
+	ui.phaseBtn:SetDisabled(not pendingMsgs and (p >= 3 or paused))
 	ui.listBtn:SetDisabled(not (p >= 3 and self:GetRemainingToRollCount() > 0))
 	ui.resetBtn:SetDisabled(p == 0)
-	ui.enterBtn:SetDisabled(personalEntered or not round.acceptEntries)
-	ui.rollBtn:SetDisabled(personalRolled or not round.acceptRolls)
+	ui.enterBtn:SetDisabled(paused or personalEntered or not round.acceptEntries)
+	ui.rollBtn:SetDisabled(paused or personalRolled or not round.acceptRolls)
 	ui.stakesEdit:SetDisabled(p ~= 0)
 	ui.ratioDrop:SetDisabled(p ~= 0)
 	if p == 0 then ui.stakesEdit:Refresh() end
@@ -967,12 +1024,16 @@ function RC:RefreshControls()
 	ui.rollFor:SetText(format("Rolling for %s%s|r   %s·|r   players %s/roll 1-%d|r",
 		Hex(T.accent), ConvertRollToGold(cap), Hex(T.muted), Hex(T.fg), cap))
 	ui.ratioNote:SetText(Label(RATIOS, CurrentRatio()))
-	ui.subtitle:SetText(format("%s   ·   %d entrants   ·   %d yet to roll",
-		PHASE_NAME[p] or PHASE_NAME[0], round.entrantsCount, self:GetRemainingToRollCount()))
+	ui.subtitle:SetText(format("%s%s   ·   %d entrants   ·   %d yet to roll",
+		PHASE_NAME[p] or PHASE_NAME[0], (paused and p > 0) and " (paused: combat)" or "",
+		round.entrantsCount, self:GetRemainingToRollCount()))
 	ui.potNote:SetText(format("Pot %s  ·  1-%d", ConvertRollToGold(cap), cap))
-	ui.topBtn:SetText("Post Top " .. db.profile.topN)
-	ui.bottomBtn:SetText("Post Bottom " .. db.profile.topN)
-	ui.statsPeriod:SetText(self:PeriodName(db.profile.histPeriod))
+	local n = db.profile.topN
+	ui.topBtn:SetText("Session Top " .. n)
+	ui.bottomBtn:SetText("Session Bottom " .. n)
+	ui.allTopBtn:SetText("All-time Top " .. n)
+	ui.allBottomBtn:SetText("All-time Bottom " .. n)
+	ui.statsPeriod:SetText("")
 end
 
 local function BuildActionRow(row)
@@ -984,6 +1045,35 @@ local function BuildActionRow(row)
 	row.mark = row:CreateTexture(nil, "ARTWORK")
 	row.mark:SetSize(2, ROW_H - 8)
 	row.mark:SetPoint("LEFT", row.rank, "RIGHT", 4, 0)
+	-- Click a player still to roll to type in the roll chat shows (Enter = take it, Esc = cancel).
+	row.edit = Field(row, 70, ROW_H - 4, function(box, text)
+		box:Hide()
+		text = Trim(text)
+		box:SetText("")
+		if text == "" or not row.entrant then return end
+		local err = RC:EnterRoll(row.entrant.name, text)
+		if err then RC:Print("|cffff5555Roll not entered:|r " .. err .. ".") end
+	end)
+	row.edit:SetPoint("RIGHT", -4, 0)
+	row.edit:SetNumeric(true)
+	row.edit:SetScript("OnEscapePressed", function(box) box:SetText(""); box:ClearFocus() end)
+	row.edit:Hide()
+	local function CanType(v) return v and round.acceptRolls and v.entered and not v.rolled end
+	row:EnableMouse(true)
+	row:SetScript("OnMouseUp", function(self)
+		if not CanType(self.entrant) then return end
+		self.edit:SetText("")
+		self.edit:Show()
+		self.edit:SetFocus()
+	end)
+	row:SetScript("OnEnter", function(self)
+		if not CanType(self.entrant) then return end
+		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+		GameTooltip:AddLine(self.entrant.name, 1, 1, 1)
+		GameTooltip:AddLine("Click to type in their roll, if the addon missed it (e.g. in combat).", 0.61, 0.65, 0.78, true)
+		GameTooltip:Show()
+	end)
+	row:SetScript("OnLeave", function() GameTooltip:Hide() end)
 end
 
 function RC:UpdateActionList()
@@ -1008,6 +1098,11 @@ function RC:UpdateActionList()
 		elseif Contains(round.lowTyers, v.key) then
 			c, mark = LOSE_RGB, LOSE_RGB
 		end
+		row.entrant = v
+		if not (round.acceptRolls and v.entered and not v.rolled) and row.edit:IsShown() then
+			row.edit:SetText(""); row.edit:ClearFocus(); row.edit:Hide()
+		end
+		if v.byHand then text = text .. "*" end
 		row.rank:SetText(i .. ".")
 		row.name:SetText(v.name)
 		SetRGB(row.name, v.entered and T.fg or T.muted)
@@ -1084,12 +1179,18 @@ function RC:BuildWindow()
 	})
 
 	-- Stats
-	local st = Card(f, "Stats", rc, CARD_TITLE + 24 + CARD_PAD)
+	-- One pair of post buttons for this session, one for all time.
+	local st = Card(f, "Stats", rc, CARD_TITLE + 24 + 6 + 24 + CARD_PAD)
 	ui.statsPeriod = st.note
 	ui.topBtn, ui.bottomBtn = ButtonRow(st, CARD_PAD, -CARD_TITLE, INNER, 24, {
-		{ "Post Top 5", function() RC:PostLeaderboard("top") end, false, "Post the biggest winners for the period chosen in History." },
-		{ "Post Bottom 5", function() RC:PostLeaderboard("bottom") end, false, "Post the biggest losers for the period chosen in History." },
+		{ "Session Top 5", function() RC:PostLeaderboard("top", nil, "session") end, false, "Post the biggest winners since you logged in (or since New session)." },
+		{ "Session Bottom 5", function() RC:PostLeaderboard("bottom", nil, "session") end, false, "Post the biggest losers since you logged in (or since New session)." },
 		{ "History", function() RC:ToggleHistory() end, false, "Leaderboard, round log, summaries and clean-up for any period." },
+	})
+	local third = floor((INNER - 16) / 3)
+	ui.allTopBtn, ui.allBottomBtn = ButtonRow(st, CARD_PAD, -CARD_TITLE - 30, INNER - third - 8, 24, {
+		{ "All-time Top 5", function() RC:PostLeaderboard("top", nil, "all") end, false, "Post the biggest winners over every round recorded." },
+		{ "All-time Bottom 5", function() RC:PostLeaderboard("bottom", nil, "all") end, false, "Post the biggest losers over every round recorded." },
 	})
 
 	-- The Action (fills the rest)
@@ -1165,7 +1266,7 @@ local function RoundTooltip(row)
 	GameTooltip:AddLine(date("%A %d %B  %H:%M", rec.t), 1, 1, 1)
 	GameTooltip:AddLine(format("Stakes %s  (1-%d, %d : 1)", Gold((rec.cap or 0) / (rec.ratio or 1)), rec.cap or 0, rec.ratio or 1), 0.7, 0.7, 0.7)
 	for _, pl in ipairs(rec.players or {}) do
-		local d = rec.deltas and rec.deltas[pl.n] or 0
+		local d = RoundDeltas(rec)[pl.n] or 0
 		local c = d > 0 and WIN_RGB or d < 0 and LOSE_RGB or { r = 0.9, g = 0.9, b = 0.9 }
 		GameTooltip:AddDoubleLine(pl.n, tostring(pl.r), c.r, c.g, c.b, c.r, c.g, c.b)
 	end
@@ -1455,20 +1556,62 @@ local CHAT_EVENTS = {
 	GUILD = { "CHAT_MSG_GUILD" }, SAY = { "CHAT_MSG_SAY" }, CHANNEL = { "CHAT_MSG_CHANNEL" }, SYSTEM = { "CHAT_MSG_SYSTEM" },
 }
 
+-- In combat Forever hands chat to addons as secret values: we can see a line
+-- arrived but not what it says or who sent it, and it stays secret (also in the
+-- chat window's history), so it can't be read after combat either. We count
+-- those lines and, once combat is over, ask for the entries again (missed).
+
 for _, method in ipairs({ "RAID", "PARTY", "GUILD", "SAY" }) do
 	RC["Chat_" .. method] = function(self, _, text, sender)
-		if EntriesOpenFor(method) and Readable(text, sender) then self:ParseEntry(text, sender) end
+		if not EntriesOpenFor(method) then return end
+		if Readable(text, sender) then self:ParseEntry(text, sender)
+		elseif text ~= nil then missed.entries = missed.entries + 1 end
 	end
 end
 
 function RC:Chat_CHANNEL(_, text, _, _, _, sender, _, _, _, channel)
-	if EntriesOpenFor("CHANNEL") and Readable(text, sender, channel) and channel == db.profile.customChannel then
-		self:ParseEntry(text, sender)
+	if not EntriesOpenFor("CHANNEL") then return end
+	if Readable(text, sender, channel) then
+		if channel == db.profile.customChannel then self:ParseEntry(text, sender) end
+	elseif text ~= nil and (issecret(channel) or channel == db.profile.customChannel) then
+		missed.entries = missed.entries + 1
 	end
 end
 
 function RC:Chat_SYSTEM(_, text)
-	if round and round.acceptRolls and Readable(text) then self:ParseRoll(text) end
+	if not (round and round.acceptRolls) then return end
+	if Readable(text) then self:ParseRoll(text)
+	elseif text ~= nil then missed.rolls = missed.rolls + 1 end
+end
+
+-- After combat: ask everyone who typed the enter word to type it again, and tell
+-- the host (only) who still has to roll - asking for re-rolls would let someone
+-- who rolled low in combat roll again.
+function RC:ReportMissedChat(tries)
+	if missed.entries == 0 and missed.rolls == 0 then return end
+	if ChatHidden() and (tries or 0) < 30 then
+		return C_Timer.After(2, function() self:ReportMissedChat((tries or 0) + 1) end)
+	end
+	local entries, rolls = missed.entries, missed.rolls
+	missed.entries, missed.rolls = 0, 0
+	if entries > 0 and round and round.acceptEntries then
+		local word = db.profile.enterMsg
+		if self:NeedsHardwareEvent() then
+			self:Print(format("%d %s in combat could not be read - ask them to type %s again.",
+				entries, Plural(entries, "message", "messages"), word))
+		else
+			self:ChatMsg(format(".:HiLo:. Chat was hidden during combat - type %s again to join!", word))
+		end
+	end
+	if rolls > 0 and round and round.acceptRolls and self:GetRemainingToRollCount() > 0 then
+		local names = {}
+		for _, v in pairs(round.entrants) do
+			if v.entered and not v.rolled then names[#names + 1] = v.name end
+		end
+		table.sort(names)
+		self:Print(format("Rolls during combat could not be read. Still to roll: %s. Check their rolls in chat and "
+			.. "click their name in the list (or /hilo roll <name> <roll>) to type them in.", concat(names, ", ")))
+	end
 end
 
 --==========================================================================
@@ -1480,6 +1623,7 @@ local HELP = {
 	"/hilo options  - open the settings",
 	"/hilo next  - advance the round phase",
 	"/hilo reset  - reset the current round",
+	"/hilo roll <name> <roll>  - type in a roll the addon missed (e.g. in combat)",
 	"/hilo gold <n>  - set stakes in gold",
 	"/hilo ratio <n>  - set roll:gold ratio (e.g. 10 or 100)",
 	"/hilo channel <name>  - set custom chat channel",
@@ -1507,6 +1651,12 @@ function RC:SlashCmd(input)
 		self:Print("Round reset.")
 	elseif cmd == "next" then
 		self:NextPhase()
+	elseif cmd == "roll" then
+		-- names have spaces ("Agi Stack"), so take everything after "roll"
+		local name, n = (input or ""):match("^%s*%S+%s+(.-)%s+(%d+)%s*$")
+		local err
+		if name and name ~= "" then err = self:EnterRoll(name, n) else err = "usage: /hilo roll <name> <roll>" end
+		if err then self:Print("|cffff5555Roll not entered:|r " .. err .. ".") end
 	elseif (cmd == "gold" or cmd == "ratio") and tonumber(rest) then
 		self:Set(cmd == "gold" and "stakesGold" or "ratio", rest)
 		self:Print(format("Stakes %dg at %d : 1 (roll 1-%d).", db.profile.stakesGold, db.profile.ratio, self:RollCap()))
@@ -1521,7 +1671,7 @@ function RC:SlashCmd(input)
 	elseif cmd == "top" or cmd == "bottom" or cmd == "summary" then
 		-- /hilo top [n] [period]  - either order, both optional
 		local n, period
-		for word in (rest or ""):gmatch("%S+") do
+		for word in ((input or ""):match("^%s*%S+(.*)$") or ""):gmatch("%S+") do   -- GetArgs only gave the 2nd word
 			word = strlower(word)
 			if tonumber(word) then n = max(1, min(25, floor(tonumber(word))))
 			else period = PERIOD_LABEL[word] and word or PERIOD_ALIAS[word] or period end
@@ -1563,7 +1713,8 @@ function RC:OnInitialize()
 		if any then tinsert(Rounds(), 1, { legacy = true, t = 0, deltas = deltas }) end
 		db.global.legacyImported = true
 	end
-	if not PERIOD_LABEL[db.profile.histPeriod] then db.profile.histPeriod = "session" end
+	if not PERIOD_LABEL[db.profile.histPeriod] then db.profile.histPeriod = "all" end
+	sessionStart = db.global.sessionStart or sessionStart
 
 	round = NewRound(self:RollCap())
 
@@ -1596,6 +1747,26 @@ function RC:OnEnable()
 	for method, events in pairs(CHAT_EVENTS) do
 		for _, event in ipairs(events) do self:RegisterEvent(event, "Chat_" .. method) end
 	end
+	self:RegisterEvent("PLAYER_REGEN_DISABLED", function()
+		if round.phase == 1 or round.phase == 2 then
+			self:Print("In combat - the round is paused until it's over.")
+		elseif round.phase == 3 then
+			self:Print("In combat - rolls made now can't be read; you can type them in afterwards.")
+		end
+		self:RefreshControls()
+	end)
+	self:RegisterEvent("PLAYER_REGEN_ENABLED", function()
+		if round.phase == 1 or round.phase == 2 then self:Print("Combat over - the round continues.") end
+		self:RefreshControls()
+		self:ReportMissedChat()
+	end)
+	self:RegisterEvent("PLAYER_ENTERING_WORLD", function(_, isInitialLogin)
+		if isInitialLogin == true or not db.global.sessionStart then
+			sessionStart = time()
+			db.global.sessionStart = sessionStart
+		end
+		self:RefreshHistory()
+	end)
 	if db.profile.loginMessage then
 		self:Print("|cffffff00Hi-Lo Casino|r loaded. Type |cff59f0dc/hilo|r to open, |cff59f0dc/hilo options|r for settings.")
 	end

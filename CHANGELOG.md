@@ -1,5 +1,34 @@
 # Hi-Lo Casino
 
+## 2.4.0
+
+- **Entries typed in combat:** Forever hides chat from addons in combat, so a `1` typed then
+  can't be read, not even afterwards. Hi-Lo Casino now notices those hidden lines and, when
+  combat ends, posts "Chat was hidden during combat - type 1 again to join!" (only a note to
+  you when the channel needs a click to post). Rolls hidden in combat get a note to you listing
+  who still has to roll; nobody is asked to re-roll.
+- **The round waits while you're in combat:** the next-phase button, Enter and Roll are greyed out
+  and the window says "paused: combat", so no round starts and no one is told to roll while chat
+  can't be read. You get a note when combat starts and ends.
+- **Type in a missed roll:** click a player who still has to roll in the list and type the roll
+  you see in chat (Enter to take it, Esc to cancel), or use `/hilo roll <name> <roll>`.
+  Typed-in rolls show a `*`.
+- `/hilo top 5 week` (and `bottom` / `summary`) now use the period you give; before, only the
+  first word after the command was read.
+- **Session and All-time buttons:** the main window posts Session Top / Bottom N and All-time
+  Top / Bottom N directly. History's buttons still post the period picked there.
+- A player whose name was saved with a hyphen in some rounds and a space in others is counted
+  as one player.
+- **History counts all rounds by default:** the period now starts on *All time*, so Top / Bottom,
+  the leaderboard and the summary add up every round. Pick another period in History if you want.
+- *This session* survives `/reload` (it only restarts on a fresh login or with New session).
+- **Top / Bottom lists fixed:** Top only lists players who are up and Bottom only players who are
+  down. Before, both listed everyone, so a winner could show up on the Bottom list.
+- **Tied rolls counted right:** "A, B owes C 5g each" now gives C 10g (and "A owes B, C 5g each"
+  takes 10g from A) in the history, leaderboards and summary. Rounds already saved are
+  recalculated too.
+- The summary only names an Unluckiest player when someone is actually down.
+
 ## 2.3.0
 
 - **Settings panel** (Options → AddOns → Hi-Lo Casino, the gear button in both windows,

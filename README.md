@@ -16,15 +16,30 @@ history with leaderboards you can post to chat.
 With Say (outside instances) or a custom channel the game only lets addons post after a click,
 so the payout waits behind an **Announce Results** button.
 
+### In combat
+
+WoW Forever hides chat from addons during combat, so an entry typed then can't be read, not even
+after combat. When that happens, Hi-Lo Casino asks in chat, once combat ends, for those players to
+type it again. Rolls made in combat can't be read either: you get a note listing who still has to
+roll, so you can check their rolls in chat.
+
+So the round waits while you're in combat: you can't start it, call last call or begin rolling,
+and the window shows *paused: combat*. If rolls still land in combat, click the player in the list
+and type the roll you see in chat (or `/hilo roll Agi Stack 523`). Typed-in rolls show a `*`.
+Nobody is asked to roll again, so no one gets a second try at a bad roll.
+
 ## History and leaderboards
 
-Every finished round is stored. Open **History** to see, for *This session*, *Today*,
-*Last 7 days*, *Last 30 days* or *All time*:
+Every finished round is stored. Open **History** to see, for *All time* (the default),
+*This session*, *Today*, *Last 7 days* or *Last 30 days*:
 
 - a leaderboard: net gold, rounds, wins/losses, best and worst round
 - a round log: hover a round for every roll, **Post** it again, or delete it
 
-Post the **Top N**, **Bottom N** or a **Summary** to chat with one click.
+The main window has one-click **Session Top / Bottom N** and **All-time Top / Bottom N** buttons.
+In History, **Top N**, **Bottom N** and **Summary** post the period you picked there. A player's
+net adds up every round in the period (win 5g, lose 5g = 0). Top only lists players who are up,
+Bottom only players who are down.
 
 ## Settings
 
@@ -51,6 +66,7 @@ Get it on [CurseForge](https://www.curseforge.com/wow/addons/hi-lo-casino) (proj
 | `/hilo summary [period]` | Post a summary of the period |
 | `/hilo newsession` | Start a new "This session" |
 | `/hilo next` / `/hilo reset` | Advance / reset the current round |
+| `/hilo roll <name> <roll>` | Type in a roll the addon missed (e.g. in combat) |
 | `/hilo gold <n>` / `/hilo ratio <n>` | Stakes in gold / roll:gold ratio |
 | `/hilo channel <name>` | Custom chat channel |
 | `/hilo minimap` | Toggle the minimap button |
