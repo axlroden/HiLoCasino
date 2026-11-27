@@ -1,5 +1,18 @@
 # Hi-Lo Casino
 
+## 2.5.0
+
+- **Play with other Hi-Lo Casino users:** players in your group, guild or custom channel who have
+  the addon see the round you run in their window and can join it with the **Enter (me)** and
+  **Roll (me)** buttons (Roll works once per round).
+- **One round at a time:** while someone runs a round, others who would reach the same players
+  can't start one ("Alpha is hosting"). If two start at once, the earlier start keeps it and the
+  other is cancelled with a note in chat. A host that disconnects stops blocking after a minute.
+- **Shared stats:** finished rounds go to your group and guild, and you catch up on missed rounds
+  when you log in or join a group. Everyone's History and leaderboards count the same games.
+  Rounds are only taken from the player who hosted them. Hover a round to see the host. Rounds
+  from others that you delete stay deleted. You can turn sharing off in the settings.
+
 ## 2.4.0
 
 - **Entries typed in combat:** Forever hides chat from addons in combat, so a `1` typed then

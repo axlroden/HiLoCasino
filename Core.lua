@@ -2,10 +2,13 @@
      Host Hi/Lo gold roll games: entries, rolls, payouts, per-round history,
      leaderboards and chat posts. Original author: Pytte.
      The windows follow NaowhForever's live theme and fonts when it is loaded.
+     Other Hi-Lo Casino users in your group / guild see the round you run (and can
+     join it with buttons), can't start a second one over it, and share finished
+     rounds so everyone's history adds up the same games (see SHARING).
 --]]
 
 local ADDON = ...
-local RC      = LibStub("AceAddon-3.0"):NewAddon("HiLoCasino", "AceConsole-3.0", "AceEvent-3.0")
+local RC      = LibStub("AceAddon-3.0"):NewAddon("HiLoCasino", "AceConsole-3.0", "AceEvent-3.0", "AceComm-3.0", "AceSerializer-3.0")
 local LDB     = LibStub("LibDataBroker-1.1", true)
 local LDBIcon = LibStub("LibDBIcon-1.0", true)
 
@@ -35,7 +38,8 @@ end
 local defaults = {
 	global = {
 		allTime = {},      -- pre-2.2 running totals (roll units); imported into rounds once
-		rounds  = {},      -- one record per finished round (see RC:ReportResults)
+		rounds  = {},      -- one record per finished round (see RC:ReportResults), oldest first
+		deleted = {},      -- ids of other hosts' rounds you deleted (so a sync doesn't bring them back)
 	},
 	profile = {
 		enterMsg = "1", withdrawMsg = "-1",
@@ -44,6 +48,7 @@ local defaults = {
 		histPeriod = "all", topN = 5,              -- overviews and the quick post buttons (all rounds by default)
 		minimap = { hide = false },
 		scale = 1, lockWindows = false, clickSound = true, loginMessage = true,
+		shareStats = true,                         -- swap finished rounds with other Hi-Lo Casino users
 	},
 }
 
@@ -241,6 +246,7 @@ function RC:ParseEntry(msg, name)
 	else
 		return
 	end
+	self:QueueState()
 	self:UpdateActionList()
 	self:RefreshControls()
 end
@@ -294,7 +300,7 @@ function RC:AddRoll(key, roll, name, byHand)
 		tinsert(round.lowTyers, key)
 	end
 
-	if self:GetRemainingToRollCount() == 0 then self:RoundWrapup(byHand) end
+	if self:GetRemainingToRollCount() == 0 then self:RoundWrapup(byHand) else self:QueueState() end
 	self:UpdateActionList()
 	self:RefreshControls()
 end
@@ -329,10 +335,15 @@ local function NoRounds(self, period)
 	self:Print("No rounds recorded for " .. self:PeriodName(period) .. ".")
 end
 
-function RC:RecordRound(rec)
+local function TrimRounds()
 	local rounds = Rounds()
-	tinsert(rounds, rec)
 	while #rounds > MAX_ROUNDS do table.remove(rounds, rounds[1].legacy and 2 or 1) end   -- keep imported totals
+end
+
+function RC:RecordRound(rec)
+	tinsert(Rounds(), rec)
+	self:ShareRound(rec)
+	TrimRounds()
 	self:RefreshHistory()
 end
 
@@ -445,11 +456,21 @@ function RC:PostRound(rec)
 end
 
 -- Removes the given record, or every record in a period; returns how many.
+-- Other hosts' rounds are remembered as deleted, or the next sync would bring them back.
 local function RemoveRounds(match)
 	local rounds, removed = Rounds(), 0
 	for i = #rounds, 1, -1 do
-		if match(rounds[i]) then table.remove(rounds, i); removed = removed + 1 end
+		local rec = rounds[i]
+		if match(rec) then
+			if rec.id and rec.host and not RC:IsMine(rec) then
+				db.global.deleted = db.global.deleted or {}
+				db.global.deleted[rec.id] = true
+			end
+			table.remove(rounds, i)
+			removed = removed + 1
+		end
 	end
+	RC:ForgetIds()
 	return removed
 end
 
@@ -514,7 +535,9 @@ function RC:ReportResults()
 end
 
 function RC:ResetRound()
+	local old = round
 	round = NewRound(self:RollCap())
+	if old and old.id and old.phase > 0 then self:SendEnd(old) end
 	missed.entries, missed.rolls = 0, 0
 	personalEntered, personalRolled = false, false
 	self:UpdateActionList()
@@ -541,8 +564,14 @@ function RC:NextPhase()
 		return self:Print("You're in combat - the round waits until it's over (chat can't be read in combat).")
 	end
 	if p == 0 then
+		local other = self:BlockingHost()
+		if other then
+			return self:Print(format("%s is already running a round - wait until it's over.", other.host))
+		end
 		round = NewRound(self:RollCap())
 		round.acceptEntries = true
+		-- id = start time: if two of us start at once, the earlier one keeps it (SHARING)
+		round.id, round.m, round.ch = GetServerTime and GetServerTime() or time(), db.profile.chatMethod, db.profile.customChannel
 		personalEntered, personalRolled = false, false
 		self:ChatMsg(format(".:Hi-Lo Casino:. RULES: %s .:. STAKES << %s >>", db.profile.rulesName, ConvertRollToGold(round.stakes)))
 		self:ChatMsg(format(".:HiLo:. To enter: type %s", db.profile.enterMsg))
@@ -556,6 +585,7 @@ function RC:NextPhase()
 		return   -- rolling: the round ends with the last roll
 	end
 	round.phase = p + 1
+	self:QueueState()
 	self:UpdateActionList()
 	self:RefreshControls()
 end
@@ -573,12 +603,16 @@ function RC:ListRemaining()
 end
 
 function RC:DoPersonalEnter()
+	local view = self:ViewedRemote()
+	if view then return self:RemoteEnter(view) end
 	self:ChatMsg(db.profile.enterMsg)
 	personalEntered = true
 	self:RefreshControls()
 end
 
 function RC:DoPersonalRoll()
+	local view = self:ViewedRemote()
+	if view then return self:RemoteRoll(view) end
 	RandomRoll(1, round.stakes)
 	personalRolled = true
 	self:RefreshControls()
@@ -1008,26 +1042,50 @@ function RC:RefreshControls()
 	if not ui or not ui.frame:IsShown() then return end
 	local p, T, cap = round.phase, Theme(), round.stakes
 
-	ui.phaseBtn:SetText(pendingMsgs and "Announce Results" or PHASE_BUTTON[p] or PHASE_BUTTON[0])
+	-- view = another user's round shown here (you're not running one); blocker =
+	-- one that keeps you from starting yours.
+	local view = self:ViewedRemote()
+	local blocker = p == 0 and self:BlockingHost() or nil
 	local paused = ChatHidden()
-	ui.phaseBtn:SetDisabled(not pendingMsgs and (p >= 3 or paused))
+	if pendingMsgs then ui.phaseBtn:SetText("Announce Results")
+	elseif blocker then ui.phaseBtn:SetText(blocker.host .. " is hosting")
+	else ui.phaseBtn:SetText(PHASE_BUTTON[p] or PHASE_BUTTON[0]) end
+	ui.phaseBtn:SetDisabled(not pendingMsgs and (p >= 3 or paused or blocker ~= nil))
 	ui.listBtn:SetDisabled(not (p >= 3 and self:GetRemainingToRollCount() > 0))
 	ui.resetBtn:SetDisabled(p == 0)
-	ui.enterBtn:SetDisabled(paused or personalEntered or not round.acceptEntries)
-	ui.rollBtn:SetDisabled(paused or personalRolled or not round.acceptRolls)
+	if view then
+		local me, clicked = view.me, self:Clicked(view)
+		ui.enterBtn:SetDisabled(not (view.ph == 1 or view.ph == 2) or (me and me.entered)
+			or (clicked.enteredAt and GetTime() - clicked.enteredAt < 5))
+		ui.rollBtn:SetDisabled(view.ph ~= 3 or not (me and me.entered) or (me and me.rolled) or clicked.rolled)
+	else
+		ui.enterBtn:SetDisabled(paused or personalEntered or not round.acceptEntries)
+		ui.rollBtn:SetDisabled(paused or personalRolled or not round.acceptRolls)
+	end
 	ui.stakesEdit:SetDisabled(p ~= 0)
 	ui.ratioDrop:SetDisabled(p ~= 0)
 	if p == 0 then ui.stakesEdit:Refresh() end
 	ui.ratioDrop:Refresh()
 	ui.channelDrop:Refresh()
 
+	local gold = ConvertRollToGold(cap)
+	if view then cap, gold = view.st, format("%dg", floor(view.st / max(1, view.ra))) end
 	ui.rollFor:SetText(format("Rolling for %s%s|r   %s·|r   players %s/roll 1-%d|r",
-		Hex(T.accent), ConvertRollToGold(cap), Hex(T.muted), Hex(T.fg), cap))
+		Hex(T.accent), gold, Hex(T.muted), Hex(T.fg), cap))
 	ui.ratioNote:SetText(Label(RATIOS, CurrentRatio()))
-	ui.subtitle:SetText(format("%s%s   ·   %d entrants   ·   %d yet to roll",
-		PHASE_NAME[p] or PHASE_NAME[0], (paused and p > 0) and " (paused: combat)" or "",
-		round.entrantsCount, self:GetRemainingToRollCount()))
-	ui.potNote:SetText(format("Pot %s  ·  1-%d", ConvertRollToGold(cap), cap))
+	if view then
+		local n, left = 0, 0
+		for _, v in ipairs(view.entrants) do
+			if v.entered then n = n + 1; if not v.rolled then left = left + 1 end end
+		end
+		ui.subtitle:SetText(format("%s's round   ·   %s   ·   %d entrants   ·   %d yet to roll",
+			view.host, PHASE_NAME[view.ph] or "", n, left))
+	else
+		ui.subtitle:SetText(format("%s%s   ·   %d entrants   ·   %d yet to roll",
+			PHASE_NAME[p] or PHASE_NAME[0], (paused and p > 0) and " (paused: combat)" or "",
+			round.entrantsCount, self:GetRemainingToRollCount()))
+	end
+	ui.potNote:SetText(format("Pot %s  ·  1-%d", gold, cap))
 	local n = db.profile.topN
 	ui.topBtn:SetText("Session Top " .. n)
 	ui.bottomBtn:SetText("Session Bottom " .. n)
@@ -1080,7 +1138,10 @@ function RC:UpdateActionList()
 	local ui = self.ui
 	if not ui or not ui.frame:IsShown() then return end
 	local T, list = Theme(), {}
-	for _, v in pairs(round.entrants) do list[#list + 1] = v end
+	local view = self:ViewedRemote()
+	local entrants, highs, lows = round.entrants, round.highTyers, round.lowTyers
+	if view then entrants, highs, lows = view.entrants, view.highs, view.lows end
+	for _, v in pairs(entrants) do list[#list + 1] = v end
 	table.sort(list, function(a, b)   -- highest roll first, then by name
 		if a.roll ~= b.roll then return a.roll > b.roll end
 		return a.name < b.name
@@ -1093,9 +1154,9 @@ function RC:UpdateActionList()
 			c, text = T.muted, "withdrawn"
 		elseif v.roll <= 0 then
 			c, text = PENDING_RGB, "—"
-		elseif Contains(round.highTyers, v.key) then
+		elseif Contains(highs, v.key) then
 			c, mark = WIN_RGB, WIN_RGB
-		elseif Contains(round.lowTyers, v.key) then
+		elseif Contains(lows, v.key) then
 			c, mark = LOSE_RGB, LOSE_RGB
 		end
 		row.entrant = v
@@ -1114,7 +1175,11 @@ function RC:UpdateActionList()
 	HidePool(ui.rows, #list + 1)
 	ui.listChild:SetHeight(max(1, #list * ROW_H))
 	ui.empty:SetShown(#list == 0)
-	ui.empty:SetText(format("No entrants yet.\nStart a round and have players type  %s%s|r", Hex(T.accent), db.profile.enterMsg))
+	if view then
+		ui.empty:SetText(format("%s is running a round.\nClick %sEnter (me)|r to join.", view.host, Hex(T.accent)))
+	else
+		ui.empty:SetText(format("No entrants yet.\nStart a round and have players type  %s%s|r", Hex(T.accent), db.profile.enterMsg))
+	end
 	ui.actionCount:SetText(#list > 0 and format("%d %s", #list, Plural(#list, "player", "players")) or "")
 end
 
@@ -1265,6 +1330,7 @@ local function RoundTooltip(row)
 	GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
 	GameTooltip:AddLine(date("%A %d %B  %H:%M", rec.t), 1, 1, 1)
 	GameTooltip:AddLine(format("Stakes %s  (1-%d, %d : 1)", Gold((rec.cap or 0) / (rec.ratio or 1)), rec.cap or 0, rec.ratio or 1), 0.7, 0.7, 0.7)
+	if rec.host and not RC:IsMine(rec) then GameTooltip:AddLine("Hosted by " .. rec.host, 0.7, 0.7, 0.7) end
 	for _, pl in ipairs(rec.players or {}) do
 		local d = RoundDeltas(rec)[pl.n] or 0
 		local c = d > 0 and WIN_RGB or d < 0 and LOSE_RGB or { r = 0.9, g = 0.9, b = 0.9 }
@@ -1492,7 +1558,7 @@ function RC:BuildOptions()
 	ChoiceOption(hist, 2, "Post count", "topN", TOP_COUNTS)
 	hist.note:SetText("for Post Top / Bottom")
 
-	local look = Card(panel, "Interface", hist, CARD_TITLE + OPT_ROW + 4 * 24 + 8 + 2 * 30 + CARD_PAD)
+	local look = Card(panel, "Interface", hist, CARD_TITLE + OPT_ROW + 5 * 24 + 8 + 2 * 30 + CARD_PAD)
 	look:SetPoint("RIGHT", hist, "RIGHT")
 	ChoiceOption(look, 1, "Window scale", "scale", SCALES)
 	local toggles = {
@@ -1500,13 +1566,14 @@ function RC:BuildOptions()
 		{ "lockWindows", "Lock window positions", Get("lockWindows"), Put("lockWindows") },
 		{ "clickSound", "Click sounds", Get("clickSound"), Put("clickSound") },
 		{ "loginMessage", "Message in chat on login", Get("loginMessage"), Put("loginMessage") },
+		{ "shareStats", "Share rounds with other Hi-Lo Casino users", Get("shareStats"), Put("shareStats") },
 	}
 	for i, t in ipairs(toggles) do
 		local tg = Toggle(look, t[2], t[3], t[4])
 		tg:SetPoint("TOPLEFT", CARD_PAD, -CARD_TITLE - OPT_ROW - (i - 1) * 24)
 		controls[t[1]] = tg
 	end
-	local by, lookW = -CARD_TITLE - OPT_ROW - 4 * 24 - 8, OPT_LABEL_W + OPT_CTRL_W   -- same width as the rows
+	local by, lookW = -CARD_TITLE - OPT_ROW - #toggles * 24 - 8, OPT_LABEL_W + OPT_CTRL_W   -- same width as the rows
 	ButtonRow(look, CARD_PAD, by, lookW, 24, {
 		{ "Open window", function() RC:ShowWindow() end },
 		{ "Open history", function() RC:BuildHistory(); RC.hist.frame:Show() end },
@@ -1612,6 +1679,360 @@ function RC:ReportMissedChat(tries)
 		self:Print(format("Rolls during combat could not be read. Still to roll: %s. Check their rolls in chat and "
 			.. "click their name in the list (or /hilo roll <name> <roll>) to type them in.", concat(names, ", ")))
 	end
+end
+
+--==========================================================================
+--  SHARING  (with other Hi-Lo Casino users, over addon messages)
+--  * The host sends the round (phase, stakes, channel, entrants and rolls) to
+--    the players who can see its chat: group, guild or the custom channel.
+--    Others show it in their window and get Enter / Roll buttons for it.
+--  * While a round is running nobody in the same audience can start another.
+--    If two start at once, the earlier start keeps it (then the lower name)
+--    and the other is cancelled.
+--  * Finished rounds go to group and guild; on login / joining a group each
+--    user asks for rounds it hasn't seen and every host answers with its own.
+--    A round is only taken from the player who hosted it.
+--==========================================================================
+
+local PREFIX, PROTO = "HiLoCasino", 1
+local STATE_TTL, HEARTBEAT, SYNC_MAX = 60, 20, 300
+local remotes = {}               -- NameKey(host) -> the round another user is running
+local clicks = {}                -- round id -> { enteredAt, rolled } from your own Enter / Roll clicks
+local roundIds                   -- id -> true for every stored round (built on first use)
+local syncSince, syncQueued = {}, {}
+local stateQueued, lastHello = false, {}
+
+local function Me() return DisplayName(UnitName("player") or "") end
+
+-- "Pytte" and "Pytte-Realm" are the same player.
+local function SameName(a, b)
+	a, b = NameKey(a or ""), NameKey(b or "")
+	return a == b or a:sub(1, #b + 1) == b .. " " or b:sub(1, #a + 1) == a .. " "
+end
+
+function RC:IsMine(rec) return not rec.host or SameName(rec.host, Me()) end
+
+local function GroupDist()
+	if IsInRaid and IsInRaid() then return "RAID" end
+	if IsInGroup and IsInGroup() then return "PARTY" end
+end
+
+-- Who can see a round run in `method` chat; withGuild adds the guild (finished rounds).
+local function Targets(method, channel, withGuild)
+	local t, guild = {}, IsInGuild and IsInGuild()
+	if method == "GUILD" then
+		if guild then t[1] = { "GUILD" } end
+		return t
+	end
+	if method == "CHANNEL" then
+		local n = GetChannelName(channel or "")
+		if n and n ~= 0 then t[#t + 1] = { "CHANNEL", n } end
+	end
+	local g = GroupDist()
+	if g then t[#t + 1] = { g } end
+	if withGuild and guild then t[#t + 1] = { "GUILD" } end
+	return t
+end
+
+function RC:Send(msg, targets, prio)
+	msg.p = PROTO
+	local text = self:Serialize(msg)
+	for _, t in ipairs(targets) do
+		pcall(self.SendCommMessage, self, PREFIX, text, t[1], t[2] and tostring(t[2]) or nil, prio or "NORMAL")
+	end
+end
+
+function RC:RefreshAll()
+	self:UpdateActionList()
+	self:RefreshControls()
+end
+
+-- ---- the running round --------------------------------------------------
+
+local function StateOf(r)
+	local e = {}
+	for _, v in pairs(r.entrants) do e[#e + 1] = { v.name, v.entered and 1 or 0, v.rolled and v.roll or 0 } end
+	return { k = "S", id = r.id, ph = r.phase, st = r.stakes, ra = CurrentRatio(), m = r.m, ch = r.ch,
+		en = db.profile.enterMsg, wd = db.profile.withdrawMsg, e = e }
+end
+
+-- Sends the round a moment later, so a burst of entries goes out as one message.
+function RC:QueueState()
+	if stateQueued or not round.id then return end
+	stateQueued = true
+	C_Timer.After(0.3, function()
+		stateQueued = false
+		if round.id and round.phase > 0 then self:Send(StateOf(round), Targets(round.m, round.ch)) end
+	end)
+end
+
+function RC:SendEnd(r) self:Send({ k = "E", id = r.id }, Targets(r.m, r.ch)) end
+
+local function Fresh()
+	local now = GetTime()
+	for k, st in pairs(remotes) do
+		if now - st.seen > STATE_TTL then remotes[k] = nil end
+	end
+	return remotes
+end
+
+-- Does another user's round reach the players yours would?
+local function Overlaps(st)
+	local mine = db.profile.chatMethod
+	if st.m == "GUILD" or mine == "GUILD" then return st.m == mine end
+	if st.m == "CHANNEL" and mine == "CHANNEL"
+		and strlower(st.ch or "") == strlower(db.profile.customChannel or "") then return true end
+	return st.dist == "RAID" or st.dist == "PARTY"
+end
+
+function RC:BlockingHost()
+	for _, st in pairs(Fresh()) do if Overlaps(st) then return st end end
+end
+
+-- The other round shown in your window (only when you aren't running one):
+-- one you're in first, else the latest.
+function RC:ViewedRemote()
+	if not round or round.phase > 0 then return end
+	local best
+	for _, st in pairs(Fresh()) do
+		if st.me and st.me.entered then return st end
+		if not best or st.seen > best.seen then best = st end
+	end
+	return best
+end
+
+function RC:Clicked(st)
+	clicks[st.id] = clicks[st.id] or {}
+	return clicks[st.id]
+end
+
+-- Enter / Roll for someone else's round: say their enter word in their channel.
+function RC:RemoteEnter(st)
+	local n
+	if st.m == "CHANNEL" then
+		n = GetChannelName(st.ch or "")
+		if not n or n == 0 then return self:Print(format("Join the channel first: /join %s", st.ch or "")) end
+	end
+	SendChat((tostring(st.en):gsub("|", "||")), st.m, nil, n)
+	self:Clicked(st).enteredAt = GetTime()
+	self:RefreshControls()
+end
+
+function RC:RemoteRoll(st)
+	if st.ph ~= 3 or not (st.me and st.me.entered) or st.me.rolled or self:Clicked(st).rolled then return end
+	RandomRoll(1, st.st)
+	self:Clicked(st).rolled = true   -- one roll per round, even if the host missed it
+	self:RefreshControls()
+end
+
+function RC:Comm_S(msg, dist, host)
+	if type(msg.e) ~= "table" or type(msg.ph) ~= "number" or type(msg.st) ~= "number" or type(msg.id) ~= "number" then return end
+	local key = NameKey(host)
+	if msg.ph <= 0 then remotes[key] = nil; return self:RefreshAll() end
+	local me = Me()
+	local st = { host = host, dist = dist, seen = GetTime(), id = msg.id, ph = msg.ph, st = msg.st,
+		ra = tonumber(msg.ra) or 1, m = tostring(msg.m or "RAID"), ch = msg.ch and tostring(msg.ch),
+		en = tostring(msg.en or "1"), entrants = {}, highs = {}, lows = {} }
+	local hi, lo
+	for _, x in ipairs(msg.e) do
+		if type(x) == "table" and type(x[1]) == "string" then
+			local roll = tonumber(x[3]) or 0
+			local v = { key = NameKey(x[1]), name = x[1], entered = x[2] == 1, rolled = roll > 0, roll = roll > 0 and roll or -1 }
+			st.entrants[#st.entrants + 1] = v
+			if SameName(v.name, me) then st.me = v end
+			if v.entered and v.rolled then
+				hi, lo = max(hi or roll, roll), min(lo or roll, roll)
+			end
+		end
+	end
+	for _, v in ipairs(st.entrants) do
+		if v.entered and v.rolled then
+			if v.roll == hi then st.highs[#st.highs + 1] = v.key end
+			if v.roll == lo then st.lows[#st.lows + 1] = v.key end
+		end
+	end
+	remotes[key] = st
+	-- Both of us started one: the earlier start keeps it (same second: lower name).
+	if round.phase > 0 and Overlaps(st) then
+		if st.id < (round.id or 0) or (st.id == round.id and key < NameKey(me)) then
+			self:Print(format("|cffff5555%s started a round first - yours is cancelled.|r", host))
+			if not self:NeedsHardwareEvent() then self:ChatMsg(format(".:HiLo:. Round cancelled - %s is hosting.", host)) end
+			self:ResetRound()
+		else
+			self:QueueState()   -- so they see ours and back off
+		end
+	end
+	self:RefreshAll()
+end
+
+function RC:Comm_E(msg, dist, host)
+	local key = NameKey(host)
+	if remotes[key] and remotes[key].id == msg.id then remotes[key] = nil end
+	self:RefreshAll()
+end
+
+-- ---- finished rounds ----------------------------------------------------
+
+local function Ids()
+	if not roundIds then
+		roundIds = {}
+		for _, rec in ipairs(Rounds()) do if rec.id then roundIds[rec.id] = true end end
+	end
+	return roundIds
+end
+function RC:ForgetIds() roundIds = nil end
+
+-- Your own rounds get an id (name@time.n) once, the first time they're shared.
+local function Stamp(rec, n)
+	if rec.id then return end
+	rec.host = rec.host or Me()
+	rec.id = format("%s@%d.%d", NameKey(rec.host), rec.t or 0, n or 0)
+	while Ids()[rec.id] do rec.id = rec.id .. "x" end
+	Ids()[rec.id] = true
+end
+
+-- What goes over the wire (deltas are worked out again on the other side).
+local function Wire(rec)
+	local w = { id = rec.id, t = rec.t, cap = rec.cap, ratio = rec.ratio, tie = rec.tie, each = rec.each, players = {} }
+	for _, pl in ipairs(rec.players or {}) do w.players[#w.players + 1] = { pl.n, pl.r } end
+	if rec.losers then w.losers, w.winners = rec.losers, rec.winners end
+	return w
+end
+
+local function Names(list)
+	if list == nil then return nil end
+	if type(list) ~= "table" then return false end
+	local out = {}
+	for _, n in ipairs(list) do
+		if type(n) ~= "string" then return false end
+		out[#out + 1] = n
+	end
+	return out
+end
+
+-- A round from `host`; only rounds they hosted themselves are taken.
+function RC:AddShared(w, host)
+	if type(w) ~= "table" or type(w.id) ~= "string" or type(w.t) ~= "number" or type(w.players) ~= "table" then return end
+	local key = NameKey(host)
+	if w.id:sub(1, #key + 1) ~= key .. "@" or Ids()[w.id] or (db.global.deleted or {})[w.id] then return end
+	local rec = { id = w.id, host = host, t = w.t, cap = tonumber(w.cap), ratio = tonumber(w.ratio), players = {}, deltas = {} }
+	for _, pl in ipairs(w.players) do
+		if type(pl) ~= "table" or type(pl[1]) ~= "string" or not tonumber(pl[2]) then return end
+		rec.players[#rec.players + 1] = { n = pl[1], r = tonumber(pl[2]) }
+	end
+	local losers, winners = Names(w.losers), Names(w.winners)
+	if losers == false or winners == false then return end
+	if w.tie then
+		rec.tie = true
+	elseif losers and winners and tonumber(w.each) and tonumber(w.each) >= 0 then
+		rec.each, rec.losers, rec.winners = floor(tonumber(w.each)), losers, winners
+	else
+		return
+	end
+	-- keep the list in time order
+	local rounds = Rounds()
+	local i = #rounds
+	while i > 0 and (rounds[i].t or 0) > rec.t do i = i - 1 end
+	tinsert(rounds, i + 1, rec)
+	Ids()[rec.id] = true
+	return true
+end
+
+function RC:ShareRound(rec)
+	if rec.legacy then return end
+	Stamp(rec, #Rounds())
+	if db.profile.shareStats then
+		self:Send({ k = "R", r = Wire(rec) }, Targets(round.m or db.profile.chatMethod, round.ch, true), "BULK")
+	end
+end
+
+function RC:Comm_R(msg, dist, host)
+	if db.profile.shareStats and self:AddShared(msg.r, host) then
+		TrimRounds()
+		self:RefreshHistory()
+	end
+end
+
+function RC:Comm_B(msg, dist, host)
+	if not db.profile.shareStats or type(msg.r) ~= "table" then return end
+	local added = 0
+	for _, w in ipairs(msg.r) do if self:AddShared(w, host) then added = added + 1 end end
+	if added > 0 then
+		TrimRounds()
+		self:RefreshHistory()
+	end
+end
+
+-- "Hello": a user came online / joined. A host re-sends its running round;
+-- with sharing on, everyone sends the rounds it hosted that the asker lacks.
+function RC:SendHello(dist)
+	if not dist or (lastHello[dist] and GetTime() - lastHello[dist] < 30) then return end
+	lastHello[dist] = GetTime()
+	local known = {}
+	for _, rec in ipairs(Rounds()) do
+		if rec.host and not self:IsMine(rec) then
+			local k = NameKey(rec.host)
+			known[k] = max(known[k] or 0, rec.t or 0)
+		end
+	end
+	self:Send({ k = "H", sh = db.profile.shareStats or nil, known = known }, { { dist } })
+end
+
+function RC:Comm_H(msg, dist, host)
+	if round.phase > 0 then self:QueueState() end
+	if not (msg.sh and db.profile.shareStats) or not (dist == "GUILD" or dist == "RAID" or dist == "PARTY") then return end
+	local since = type(msg.known) == "table" and tonumber(msg.known[NameKey(Me())]) or 0
+	syncSince[dist] = min(syncSince[dist] or since, since)
+	if syncQueued[dist] then return end
+	syncQueued[dist] = true
+	C_Timer.After(2 + math.random() * 3, function()   -- gather everyone asking at once
+		syncQueued[dist] = nil
+		local from = syncSince[dist] or 0
+		syncSince[dist] = nil
+		local rounds, list = Rounds(), {}
+		for i = #rounds, 1, -1 do
+			local rec = rounds[i]
+			if (rec.t or 0) <= from or #list >= SYNC_MAX then break end
+			if not rec.legacy and self:IsMine(rec) then
+				Stamp(rec, i)
+				tinsert(list, 1, Wire(rec))
+			end
+		end
+		if #list > 0 then self:Send({ k = "B", r = list }, { { dist } }, "BULK") end
+	end)
+end
+
+function RC:OnComm(prefix, text, dist, sender)
+	if prefix ~= PREFIX or not Readable(text, dist, sender) then return end
+	if SameName(sender, Me()) then return end
+	local ok, msg = self:Deserialize(text)
+	if not ok or type(msg) ~= "table" or msg.p ~= PROTO then return end
+	local handler = self["Comm_" .. tostring(msg.k)]
+	if handler then handler(self, msg, dist, DisplayName(sender)) end
+end
+
+function RC:StartSharing()
+	self:RegisterComm(PREFIX, "OnComm")
+	local inGroup = GroupDist()
+	self:RegisterEvent("GROUP_ROSTER_UPDATE", function()
+		local now = GroupDist()
+		if now and now ~= inGroup then C_Timer.After(3, function() self:SendHello(GroupDist()) end) end
+		inGroup = now
+	end)
+	C_Timer.After(8, function()
+		self:SendHello(GroupDist())
+		if IsInGuild and IsInGuild() then self:SendHello("GUILD") end
+	end)
+	-- Heartbeat: a running round is re-sent every HEARTBEAT s; every 5 s a host
+	-- gone quiet stops blocking and the Enter button's short lock-out ends.
+	local ticks = 0
+	local function Beat()
+		ticks = ticks + 1
+		if round.phase > 0 and ticks % (HEARTBEAT / 5) == 0 then self:QueueState() end
+		if next(remotes) ~= nil then Fresh(); self:RefreshAll() end
+		C_Timer.After(5, Beat)
+	end
+	C_Timer.After(5, Beat)
 end
 
 --==========================================================================
@@ -1747,6 +2168,7 @@ function RC:OnEnable()
 	for method, events in pairs(CHAT_EVENTS) do
 		for _, event in ipairs(events) do self:RegisterEvent(event, "Chat_" .. method) end
 	end
+	self:StartSharing()
 	self:RegisterEvent("PLAYER_REGEN_DISABLED", function()
 		if round.phase == 1 or round.phase == 2 then
 			self:Print("In combat - the round is paused until it's over.")

@@ -28,6 +28,23 @@ and the window shows *paused: combat*. If rolls still land in combat, click the 
 and type the roll you see in chat (or `/hilo roll Agi Stack 523`). Typed-in rolls show a `*`.
 Nobody is asked to roll again, so no one gets a second try at a bad roll.
 
+## Playing with other Hi-Lo Casino users
+
+Players in your group, guild or custom channel who also have Hi-Lo Casino:
+
+- **See your round** in their window (*Alpha's round*: entrants, rolls, high and low) and join it
+  with the **Enter (me)** and **Roll (me)** buttons. Enter types the enter word in your channel
+  for them, and Roll does the right `/roll`. Roll works once per round.
+- **Can't start a second round over yours.** Their start button says *Alpha is hosting* until
+  your round ends. That only applies to rounds the same players would see: a guild round
+  doesn't block a raid round. If two of you start in the same moment, the earlier start keeps it
+  and the other round is cancelled. If a host disconnects, their round stops blocking after a minute.
+- **Share finished rounds**, so everyone's History and leaderboards count the same games. Rounds
+  go to your group and guild when they finish. When you log in or join a group, you get the rounds
+  you missed (up to 300 per host). A round is only taken from the player who hosted it, and
+  hovering it in History shows who that was. Rounds from others that you delete stay deleted.
+  Turn it off with **Share rounds with other Hi-Lo Casino users** in the settings.
+
 ## History and leaderboards
 
 Every finished round is stored. Open **History** to see, for *All time* (the default),
@@ -50,7 +67,7 @@ button in either window, Ctrl-click on the minimap icon, or `/hilo options`.
 - **Chat keywords**: what players type to enter and withdraw
 - **History**: default period and how many players Top/Bottom posts list
 - **Interface**: window scale, minimap button, lock window positions, click sounds,
-  login message, reset window positions
+  login message, sharing rounds with other users, reset window positions
 
 ## Commands
 
